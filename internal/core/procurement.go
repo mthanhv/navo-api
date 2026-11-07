@@ -24,15 +24,16 @@ import (
 
 // PurchaseOrder is sent to a supplier and always belongs to one contract (BR-03).
 type PurchaseOrder struct {
-	ID             uuid.UUID `json:"id"`
-	Number         string    `json:"number"`
-	ContractID     uuid.UUID `json:"contract_id"`
-	ContractNumber string    `json:"contract_number"`
-	SupplierID     uuid.UUID `json:"supplier_id"`
-	SupplierName   string    `json:"supplier_name"`
-	Status         string    `json:"status"`
-	Currency       string    `json:"currency"`
-	Lines          []POLine  `json:"lines"`
+	ID             uuid.UUID     `json:"id"`
+	Number         string        `json:"number"`
+	ContractID     uuid.UUID     `json:"contract_id"`
+	ContractNumber string        `json:"contract_number"`
+	SupplierID     uuid.UUID     `json:"supplier_id"`
+	SupplierName   string        `json:"supplier_name"`
+	Status         string        `json:"status"`
+	Currency       string        `json:"currency"`
+	Lines          []POLine      `json:"lines"`
+	Override       *OverrideInfo `json:"override"`
 }
 
 // POLine references exactly one line of the same contract. UnitPrice is the
@@ -57,6 +58,9 @@ func loadPO(ctx context.Context, q db.Querier, id uuid.UUID, p *access.Principal
 		WHERE po.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2)`, id, p.OwnerFilter()).
 		Scan(&po.ID, &po.Number, &po.ContractID, &po.ContractNumber, &po.SupplierID, &po.SupplierName, &po.Status, &po.Currency)
 	if err != nil {
+		return nil, err
+	}
+	if po.Override, err = latestOverride(ctx, q, "purchase_order", id); err != nil {
 		return nil, err
 	}
 	rows, err := q.Query(ctx, `SELECT pol.id, pol.contract_line_id, cl.line_no, cl.name_on_contract, pol.supplier_item_name, cl.unit,
@@ -217,9 +221,7 @@ func (h *Handlers) GetPurchaseOrder(c *gin.Context) {
 	response.OK(c, po)
 }
 
-// ConfirmPurchaseOrder handles POST /purchase-orders/:id/confirm. Contract
-// lines are locked in id order and totals re-read after the lock, so two
-// confirmations cannot together exceed the contract (AC-12).
+// ConfirmPurchaseOrder handles POST /purchase-orders/:id/confirm for the PO's owner scope.
 func (h *Handlers) ConfirmPurchaseOrder(c *gin.Context) {
 	p := auth.Principal(c)
 	id, err := httpx.PathID(c, "id")
@@ -229,66 +231,89 @@ func (h *Handlers) ConfirmPurchaseOrder(c *gin.Context) {
 	}
 	httpx.Command(c, h.Pool, "purchase_orders.confirm", true, 200, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
-		var status string
-		var contractID uuid.UUID
-		if err := tx.QueryRow(ctx, `SELECT po.status, po.contract_id FROM purchase_orders po JOIN contracts c ON c.id = po.contract_id
-			WHERE po.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2) FOR UPDATE OF po`, id, p.OwnerFilter()).Scan(&status, &contractID); err != nil {
+		var found uuid.UUID
+		if err := tx.QueryRow(ctx, `SELECT po.id FROM purchase_orders po JOIN contracts c ON c.id = po.contract_id
+			WHERE po.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2)`, id, p.OwnerFilter()).Scan(&found); err != nil {
 			return nil, err
 		}
-		if status != "draft" {
-			return nil, apperrors.Rule("document_not_draft", "Only a draft purchase order can be confirmed.", map[string]any{"status": status})
-		}
-		rows, err := tx.Query(ctx, `SELECT cl.id, cl.line_no, cl.quantity::text, pol.quantity::text
-			FROM contract_lines cl JOIN purchase_order_lines pol ON pol.contract_line_id = cl.id AND pol.purchase_order_id = $1
-			ORDER BY cl.id FOR UPDATE OF cl`, id)
-		if err != nil {
-			return nil, err
-		}
-		type check struct {
-			lineID           uuid.UUID
-			lineNo           int
-			contractQty, req decimal.Decimal
-		}
-		var checks []check
-		for rows.Next() {
-			var ch check
-			var cq, rq string
-			if err := rows.Scan(&ch.lineID, &ch.lineNo, &cq, &rq); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			ch.contractQty, ch.req = decimalx.MustParse(cq), decimalx.MustParse(rq)
-			checks = append(checks, ch)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
-		lineIDs := make([]uuid.UUID, len(checks))
-		for i, ch := range checks {
-			lineIDs[i] = ch.lineID
-			var ordered string
-			if err := tx.QueryRow(ctx, `SELECT coalesce(sum(pol.quantity), 0)::text FROM purchase_order_lines pol
-				JOIN purchase_orders po ON po.id = pol.purchase_order_id WHERE pol.contract_line_id = $1 AND po.status = 'confirmed'`, ch.lineID).Scan(&ordered); err != nil {
-				return nil, err
-			}
-			already := decimalx.MustParse(ordered)
-			if already.Add(ch.req).GreaterThan(ch.contractQty) {
-				// BR-05: an over-order needs Admin approval (approval requests: next increment).
-				return nil, apperrors.Rule("quantity_exceeds_contract", "This order would exceed the contract quantity. Save as draft or ask Admin to approve.",
-					map[string]any{"line_no": ch.lineNo, "contract_quantity": ch.contractQty.String(), "already_ordered": already.String(), "requested": ch.req.String()})
-			}
-		}
-		if _, err := tx.Exec(ctx, `UPDATE purchase_orders SET status = 'confirmed', confirmed_at = now(), confirmed_by = $2, version = version + 1, updated_at = now()
-			WHERE id = $1`, id, p.UserID); err != nil {
-			return nil, err
-		}
-		if err := touchLines(ctx, tx, lineIDs); err != nil {
-			return nil, err
-		}
-		if err := audit.Record(ctx, tx, "confirm", "purchase_order", id, map[string]any{"status": []string{"draft", "confirmed"}}); err != nil {
+		if err := confirmPOTx(ctx, tx, id, p.UserID, false); err != nil {
 			return nil, err
 		}
 		return loadPO(ctx, tx, id, p)
 	})
+}
+
+// confirmPOTx confirms a draft PO. Contract lines are locked in id order and totals
+// re-read after the lock, so two confirmations cannot together exceed the contract
+// (AC-12). allowOverContract is set only by an approved Admin override (BR-05).
+func confirmPOTx(ctx context.Context, tx pgx.Tx, id, actor uuid.UUID, allowOverContract bool) error {
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM purchase_orders WHERE id = $1 FOR UPDATE`, id).Scan(&status); err != nil {
+		return err
+	}
+	if status != "draft" {
+		return apperrors.Rule("document_not_draft", "Only a draft purchase order can be confirmed.", map[string]any{"status": status})
+	}
+	checks, err := lockLinesFor(ctx, tx, `SELECT cl.id, cl.line_no, cl.quantity::text, pol.quantity::text
+		FROM contract_lines cl JOIN purchase_order_lines pol ON pol.contract_line_id = cl.id AND pol.purchase_order_id = $1
+		ORDER BY cl.id FOR UPDATE OF cl`, id)
+	if err != nil {
+		return err
+	}
+	lineIDs := make([]uuid.UUID, len(checks))
+	for i, ch := range checks {
+		lineIDs[i] = ch.lineID
+		already, err := orderedSoFar(ctx, tx, ch.lineID)
+		if err != nil {
+			return err
+		}
+		if !allowOverContract && already.Add(ch.req).GreaterThan(ch.contractQty) {
+			return apperrors.Rule("quantity_exceeds_contract", "This order would exceed the contract quantity. Save as draft or ask Admin to approve.",
+				map[string]any{"line_no": ch.lineNo, "contract_quantity": ch.contractQty.String(), "already_ordered": already.String(), "requested": ch.req.String()})
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE purchase_orders SET status = 'confirmed', confirmed_at = now(), confirmed_by = $2, version = version + 1, updated_at = now()
+		WHERE id = $1`, id, actor); err != nil {
+		return err
+	}
+	if err := touchLines(ctx, tx, lineIDs); err != nil {
+		return err
+	}
+	return audit.Record(ctx, tx, "confirm", "purchase_order", id, map[string]any{"status": []string{"draft", "confirmed"}, "over_contract_approved": allowOverContract})
+}
+
+// lineCheck is a contract line locked for a confirmation.
+type lineCheck struct {
+	lineID           uuid.UUID
+	lineNo           int
+	contractQty, req decimal.Decimal
+}
+
+func lockLinesFor(ctx context.Context, tx pgx.Tx, sql string, docID uuid.UUID) ([]lineCheck, error) {
+	rows, err := tx.Query(ctx, sql, docID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []lineCheck
+	for rows.Next() {
+		var ch lineCheck
+		var cq, rq string
+		if err := rows.Scan(&ch.lineID, &ch.lineNo, &cq, &rq); err != nil {
+			return nil, err
+		}
+		ch.contractQty, ch.req = decimalx.MustParse(cq), decimalx.MustParse(rq)
+		out = append(out, ch)
+	}
+	return out, rows.Err()
+}
+
+func orderedSoFar(ctx context.Context, q db.Querier, lineID uuid.UUID) (decimal.Decimal, error) {
+	var s string
+	err := q.QueryRow(ctx, `SELECT coalesce(sum(pol.quantity), 0)::text FROM purchase_order_lines pol
+		JOIN purchase_orders po ON po.id = pol.purchase_order_id WHERE pol.contract_line_id = $1 AND po.status = 'confirmed'`, lineID).Scan(&s)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	return decimalx.MustParse(s), nil
 }

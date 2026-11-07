@@ -73,6 +73,13 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	a.POST("/delivery-orders/:id/confirm", need(access.FulfillmentConfirm), co.ConfirmDeliveryOrder)
 
 	a.GET("/contracts/:id/documents", need(access.ContractsRead), co.ContractDocuments)
+	a.GET("/purchase-orders", need(access.ContractsRead), co.ListPurchaseOrders)
+	a.GET("/delivery-orders", need(access.ContractsRead), co.ListDeliveryOrders)
+	a.POST("/purchase-orders/:id/override-request", need(access.ProcurementWrite), co.RequestPOOverride)
+	a.POST("/delivery-orders/:id/override-request", need(access.FulfillmentWrite), co.RequestDOOverride)
+	a.GET("/override-requests", need(access.QuantityOverride), co.ListOverrides)
+	a.POST("/override-requests/:id/approve", need(access.QuantityOverride), co.ApproveOverride)
+	a.POST("/override-requests/:id/reject", need(access.QuantityOverride), co.RejectOverride)
 	a.GET("/reports/contract-lines", need(access.ContractsRead), co.ReportContractLines)
 	a.GET("/reports/overview", need(access.ContractsRead), co.ReportOverview)
 

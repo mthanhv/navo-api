@@ -236,15 +236,16 @@ func (h *Handlers) ConfirmGoodsReceipt(c *gin.Context) {
 
 // DeliveryOrder is a planned (draft) or confirmed delivery to the customer.
 type DeliveryOrder struct {
-	ID          uuid.UUID `json:"id"`
-	Number      string    `json:"number"`
-	ContractID  uuid.UUID `json:"contract_id"`
-	Status      string    `json:"status"`
-	PlannedOn   *string   `json:"planned_on"`
-	Firmness    string    `json:"firmness"`
-	Route       string    `json:"route"`
-	DeliveredOn *string   `json:"delivered_on"`
-	Lines       []DOLine  `json:"lines"`
+	ID          uuid.UUID     `json:"id"`
+	Number      string        `json:"number"`
+	ContractID  uuid.UUID     `json:"contract_id"`
+	Status      string        `json:"status"`
+	PlannedOn   *string       `json:"planned_on"`
+	Firmness    string        `json:"firmness"`
+	Route       string        `json:"route"`
+	DeliveredOn *string       `json:"delivered_on"`
+	Lines       []DOLine      `json:"lines"`
+	Override    *OverrideInfo `json:"override"`
 }
 
 // DOLine is a quantity of one contract line.
@@ -264,6 +265,9 @@ func loadDO(ctx context.Context, q db.Querier, id uuid.UUID, p *access.Principal
 		return nil, err
 	}
 	d.PlannedOn, d.DeliveredOn = dateString(planned), dateString(delivered)
+	if d.Override, err = latestOverride(ctx, q, "delivery_order", id); err != nil {
+		return nil, err
+	}
 	rows, err := q.Query(ctx, `SELECT dol.contract_line_id, cl.line_no, dol.quantity::text FROM delivery_order_lines dol
 		JOIN contract_lines cl ON cl.id = dol.contract_line_id WHERE dol.delivery_order_id = $1 ORDER BY cl.line_no`, id)
 	if err != nil {
@@ -384,10 +388,7 @@ type confirmDOInput struct {
 	DeliveredOn *string `json:"delivered_on"`
 }
 
-// ConfirmDeliveryOrder handles POST /delivery-orders/:id/confirm. Delivered
-// quantities count once even if retried (AC-04), may not exceed the contract
-// (Admin approval comes with the approval flow) and need goods received for
-// the line: a PO number is not proof the goods exist.
+// ConfirmDeliveryOrder handles POST /delivery-orders/:id/confirm for the DO's owner scope.
 func (h *Handlers) ConfirmDeliveryOrder(c *gin.Context) {
 	p := auth.Principal(c)
 	id, err := httpx.PathID(c, "id")
@@ -411,73 +412,65 @@ func (h *Handlers) ConfirmDeliveryOrder(c *gin.Context) {
 	}
 	httpx.Command(c, h.Pool, "delivery_orders.confirm", true, 200, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
-		var status string
-		if err := tx.QueryRow(ctx, `SELECT d.status FROM delivery_orders d JOIN contracts c ON c.id = d.contract_id
-			WHERE d.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2) FOR UPDATE OF d`, id, p.OwnerFilter()).Scan(&status); err != nil {
+		var found uuid.UUID
+		if err := tx.QueryRow(ctx, `SELECT d.id FROM delivery_orders d JOIN contracts c ON c.id = d.contract_id
+			WHERE d.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2)`, id, p.OwnerFilter()).Scan(&found); err != nil {
 			return nil, err
 		}
-		if status != "draft" {
-			return nil, apperrors.Rule("document_not_draft", "Only a planned delivery can be confirmed.", map[string]any{"status": status})
-		}
-		rows, err := tx.Query(ctx, `SELECT cl.id, cl.line_no, cl.quantity::text, dol.quantity::text
-			FROM contract_lines cl JOIN delivery_order_lines dol ON dol.contract_line_id = cl.id AND dol.delivery_order_id = $1
-			ORDER BY cl.id FOR UPDATE OF cl`, id)
-		if err != nil {
-			return nil, err
-		}
-		type check struct {
-			lineID           uuid.UUID
-			lineNo           int
-			contractQty, req decimal.Decimal
-		}
-		var checks []check
-		for rows.Next() {
-			var ch check
-			var cq, rq string
-			if err := rows.Scan(&ch.lineID, &ch.lineNo, &cq, &rq); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			ch.contractQty, ch.req = decimalx.MustParse(cq), decimalx.MustParse(rq)
-			checks = append(checks, ch)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
-		lineIDs := make([]uuid.UUID, len(checks))
-		for i, ch := range checks {
-			lineIDs[i] = ch.lineID
-			var deliveredSoFar, received string
-			if err := tx.QueryRow(ctx, `SELECT
-					coalesce((SELECT sum(dol.quantity) FROM delivery_order_lines dol JOIN delivery_orders d ON d.id = dol.delivery_order_id
-					          WHERE dol.contract_line_id = $1 AND d.status = 'confirmed'), 0)::text,
-					coalesce((SELECT sum(grl.accepted_quantity) FROM goods_receipt_lines grl JOIN goods_receipts gr ON gr.id = grl.goods_receipt_id
-					          JOIN purchase_order_lines pol ON pol.id = grl.purchase_order_line_id
-					          WHERE pol.contract_line_id = $1 AND gr.status = 'confirmed'), 0)::text`, ch.lineID).Scan(&deliveredSoFar, &received); err != nil {
-				return nil, err
-			}
-			done, in := decimalx.MustParse(deliveredSoFar), decimalx.MustParse(received)
-			if done.Add(ch.req).GreaterThan(ch.contractQty) {
-				return nil, apperrors.Rule("delivery_exceeds_contract", "This delivery would exceed the contract quantity. Ask Admin to approve an over-delivery.",
-					map[string]any{"line_no": ch.lineNo, "contract_quantity": ch.contractQty.String(), "already_delivered": done.String(), "requested": ch.req.String()})
-			}
-			if available := in.Sub(done); ch.req.GreaterThan(available) {
-				return nil, apperrors.Rule("insufficient_stock", "Not enough goods have been received for this line yet.",
-					map[string]any{"line_no": ch.lineNo, "available": available.String(), "requested": ch.req.String()})
-			}
-		}
-		if _, err := tx.Exec(ctx, `UPDATE delivery_orders SET status = 'confirmed', delivered_on = $2, confirmed_at = now(), confirmed_by = $3,
-			version = version + 1, updated_at = now() WHERE id = $1`, id, *delivered, p.UserID); err != nil {
-			return nil, err
-		}
-		if err := touchLines(ctx, tx, lineIDs); err != nil {
-			return nil, err
-		}
-		if err := audit.Record(ctx, tx, "confirm", "delivery_order", id, map[string]any{"status": []string{"draft", "confirmed"},
-			"delivered_on": delivered.Format(time.DateOnly)}); err != nil {
+		if err := confirmDOTx(ctx, tx, id, *delivered, p.UserID, false); err != nil {
 			return nil, err
 		}
 		return loadDO(ctx, tx, id, p)
 	})
+}
+
+// confirmDOTx confirms a planned delivery. Delivered quantities count once even if
+// retried (AC-04) and need goods received for the line (a PO is not proof the goods
+// exist; no override can change that). Exceeding the contract needs an approved
+// Admin override (allowOverContract, BR-05).
+func confirmDOTx(ctx context.Context, tx pgx.Tx, id uuid.UUID, deliveredOn time.Time, actor uuid.UUID, allowOverContract bool) error {
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM delivery_orders WHERE id = $1 FOR UPDATE`, id).Scan(&status); err != nil {
+		return err
+	}
+	if status != "draft" {
+		return apperrors.Rule("document_not_draft", "Only a planned delivery can be confirmed.", map[string]any{"status": status})
+	}
+	checks, err := lockLinesFor(ctx, tx, `SELECT cl.id, cl.line_no, cl.quantity::text, dol.quantity::text
+		FROM contract_lines cl JOIN delivery_order_lines dol ON dol.contract_line_id = cl.id AND dol.delivery_order_id = $1
+		ORDER BY cl.id FOR UPDATE OF cl`, id)
+	if err != nil {
+		return err
+	}
+	lineIDs := make([]uuid.UUID, len(checks))
+	for i, ch := range checks {
+		lineIDs[i] = ch.lineID
+		var deliveredSoFar, received string
+		if err := tx.QueryRow(ctx, `SELECT
+				coalesce((SELECT sum(dol.quantity) FROM delivery_order_lines dol JOIN delivery_orders d ON d.id = dol.delivery_order_id
+				          WHERE dol.contract_line_id = $1 AND d.status = 'confirmed'), 0)::text,
+				coalesce((SELECT sum(grl.accepted_quantity) FROM goods_receipt_lines grl JOIN goods_receipts gr ON gr.id = grl.goods_receipt_id
+				          JOIN purchase_order_lines pol ON pol.id = grl.purchase_order_line_id
+				          WHERE pol.contract_line_id = $1 AND gr.status = 'confirmed'), 0)::text`, ch.lineID).Scan(&deliveredSoFar, &received); err != nil {
+			return err
+		}
+		done, in := decimalx.MustParse(deliveredSoFar), decimalx.MustParse(received)
+		if !allowOverContract && done.Add(ch.req).GreaterThan(ch.contractQty) {
+			return apperrors.Rule("delivery_exceeds_contract", "This delivery would exceed the contract quantity. Ask Admin to approve an over-delivery.",
+				map[string]any{"line_no": ch.lineNo, "contract_quantity": ch.contractQty.String(), "already_delivered": done.String(), "requested": ch.req.String()})
+		}
+		if available := in.Sub(done); ch.req.GreaterThan(available) {
+			return apperrors.Rule("insufficient_stock", "Not enough goods have been received for this line yet.",
+				map[string]any{"line_no": ch.lineNo, "available": available.String(), "requested": ch.req.String()})
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE delivery_orders SET status = 'confirmed', delivered_on = $2, confirmed_at = now(), confirmed_by = $3,
+		version = version + 1, updated_at = now() WHERE id = $1`, id, deliveredOn, actor); err != nil {
+		return err
+	}
+	if err := touchLines(ctx, tx, lineIDs); err != nil {
+		return err
+	}
+	return audit.Record(ctx, tx, "confirm", "delivery_order", id, map[string]any{"status": []string{"draft", "confirmed"},
+		"delivered_on": deliveredOn.Format(time.DateOnly), "over_contract_approved": allowOverContract})
 }
