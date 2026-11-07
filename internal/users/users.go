@@ -166,3 +166,129 @@ func nonNil(s []string) []string {
 	}
 	return s
 }
+
+// UpdateInput replaces a user's name, roles, grants and active flag (email is the
+// sign-in identity and stays).
+type UpdateInput struct {
+	FullName string   `json:"full_name"`
+	Roles    []string `json:"roles"`
+	Grants   []string `json:"grants"`
+	IsActive bool     `json:"is_active"`
+}
+
+func (in *UpdateInput) validate() error {
+	probe := Input{Email: "probe@navo.local", FullName: in.FullName, Password: "0123456789", Roles: in.Roles, Grants: in.Grants}
+	err := probe.Validate()
+	in.FullName = probe.FullName
+	return err
+}
+
+// UpdateUser handles PATCH /users/:id. Admin cannot lock themselves out (deactivate
+// or drop their own admin role), may only add grants they hold themselves, and a
+// deactivated user's sessions end at once.
+func (h *Handlers) UpdateUser(c *gin.Context) {
+	p := auth.Principal(c)
+	id, err := httpx.PathID(c, "id")
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	var in UpdateInput
+	if err := httpx.Decode(c, &in); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	if err := in.validate(); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	if id == p.UserID && (!in.IsActive || !contains(in.Roles, "admin")) {
+		response.Fail(c, apperrors.Rule("cannot_lock_out_self", "You cannot deactivate yourself or remove your own Admin role.", nil))
+		return
+	}
+	httpx.Command(c, h.Pool, "users.update", false, 200, func(tx pgx.Tx) (any, error) {
+		ctx := c.Request.Context()
+		var u User
+		if err := tx.QueryRow(ctx, `SELECT id, email, full_name, is_active,
+				coalesce((SELECT array_agg(role ORDER BY role) FROM user_roles WHERE user_id = u.id), '{}'),
+				coalesce((SELECT array_agg(grant_code ORDER BY grant_code) FROM user_grants WHERE user_id = u.id), '{}')
+			FROM users u WHERE id = $1 FOR UPDATE`, id).Scan(&u.ID, &u.Email, &u.FullName, &u.IsActive, &u.Roles, &u.Grants); err != nil {
+			return nil, err
+		}
+		for _, g := range in.Grants {
+			if !contains(u.Grants, g) && !p.Can(access.Permission(g)) {
+				return nil, apperrors.Forbidden("grant_" + g)
+			}
+		}
+		if _, err := tx.Exec(ctx, `UPDATE users SET full_name = $2, is_active = $3, updated_at = now() WHERE id = $1`, id, in.FullName, in.IsActive); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM user_roles WHERE user_id = $1 AND NOT (role = ANY($2))`, id, in.Roles); err != nil {
+			return nil, err
+		}
+		for _, r := range in.Roles {
+			if _, err := tx.Exec(ctx, `INSERT INTO user_roles (user_id, role) VALUES ($1, $2) ON CONFLICT DO NOTHING`, id, r); err != nil {
+				return nil, err
+			}
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM user_grants WHERE user_id = $1 AND NOT (grant_code = ANY($2))`, id, nonNil(in.Grants)); err != nil {
+			return nil, err
+		}
+		for _, g := range in.Grants {
+			if _, err := tx.Exec(ctx, `INSERT INTO user_grants (user_id, grant_code, granted_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, id, g, p.UserID); err != nil {
+				return nil, err
+			}
+		}
+		if !in.IsActive {
+			if err := auth.RevokeSessions(ctx, tx, id, ""); err != nil {
+				return nil, err
+			}
+		}
+		changes := map[string]any{"full_name": []string{u.FullName, in.FullName}, "roles": []any{u.Roles, in.Roles},
+			"grants": []any{u.Grants, nonNil(in.Grants)}, "is_active": []bool{u.IsActive, in.IsActive}}
+		return User{ID: id, Email: u.Email, FullName: in.FullName, IsActive: in.IsActive, Roles: in.Roles, Grants: nonNil(in.Grants)},
+			audit.Record(ctx, tx, "update", "user", id, changes)
+	})
+}
+
+type passwordInput struct {
+	Password string `json:"password"`
+}
+
+// ResetPassword handles POST /users/:id/password: Admin sets a temporary password
+// (told to the user in person) and every session of that user ends.
+func (h *Handlers) ResetPassword(c *gin.Context) {
+	id, err := httpx.PathID(c, "id")
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	var in passwordInput
+	if err := httpx.Decode(c, &in); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	if err := auth.ValidatePassword("password", in.Password); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	httpx.Command(c, h.Pool, "users.reset_password", false, 200, func(tx pgx.Tx) (any, error) {
+		ctx := c.Request.Context()
+		if err := auth.SetPassword(ctx, tx, id, in.Password); err != nil {
+			return nil, err
+		}
+		if err := auth.RevokeSessions(ctx, tx, id, ""); err != nil {
+			return nil, err
+		}
+		return gin.H{"id": id, "password_reset": true}, audit.Record(ctx, tx, "reset_password", "user", id, nil)
+	})
+}
+
+func contains(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}

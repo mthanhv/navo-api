@@ -185,12 +185,12 @@ func (h *Handlers) ListOverrides(c *gin.Context) {
 	page, size := httpx.Page(c)
 	decided := c.Query("status") == "decided"
 	var total int
-	if err := h.Pool.QueryRow(ctx, `SELECT count(*) FROM quantity_override_requests WHERE (status = 'pending') = $1`, !decided).Scan(&total); err != nil {
+	if err := h.Pool.QueryRow(ctx, `SELECT count(*) FROM quantity_override_requests WHERE (status = 'pending') = $1 AND status <> 'withdrawn'`, !decided).Scan(&total); err != nil {
 		response.Fail(c, err)
 		return
 	}
 	order := map[bool]string{false: `requested_at`, true: `decided_at DESC`}[decided]
-	rows, err := h.Pool.Query(ctx, `SELECT id FROM quantity_override_requests WHERE (status = 'pending') = $1 ORDER BY `+order+`, id LIMIT $2 OFFSET $3`,
+	rows, err := h.Pool.Query(ctx, `SELECT id FROM quantity_override_requests WHERE (status = 'pending') = $1 AND status <> 'withdrawn' ORDER BY `+order+`, id LIMIT $2 OFFSET $3`,
 		!decided, size, (page-1)*size)
 	if err != nil {
 		response.Fail(c, err)

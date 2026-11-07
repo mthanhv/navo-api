@@ -23,6 +23,11 @@ import (
 func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	// Only the edge proxy (Caddy on the private Docker network, or localhost) may set
+	// X-Forwarded-For; otherwise a client could pick its own IP and dodge the login limit.
+	if err := r.SetTrustedProxies([]string{"127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}); err != nil {
+		panic(err)
+	}
 	r.Use(middleware.Recover(), middleware.RequestID(), middleware.AccessLog(), middleware.CORS(cfg.AllowedOrigins))
 
 	r.GET("/healthz", func(c *gin.Context) { response.OK(c, gin.H{"status": "ok"}) })
@@ -48,29 +53,38 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	a := v1.Group("", authSvc.Authenticate())
 	a.POST("/auth/logout", authSvc.Logout)
 	a.GET("/me", authSvc.Me)
+	a.POST("/me/password", authSvc.ChangePassword)
 
 	a.GET("/users", need(access.UsersManage), us.ListUsers)
 	a.POST("/users", need(access.UsersManage), us.CreateUser)
+	a.PATCH("/users/:id", need(access.UsersManage), us.UpdateUser)
+	a.POST("/users/:id/password", need(access.UsersManage), us.ResetPassword)
 
 	a.GET("/organizations", need(access.ContractsRead), md.ListOrganizations)
 	a.POST("/organizations", need(access.PartnersWrite), md.CreateOrganization)
+	a.PATCH("/organizations/:id", need(access.PartnersWrite), md.UpdateOrganization)
 	a.GET("/products", need(access.ContractsRead), md.ListProducts)
 	a.POST("/products", need(access.CatalogWrite), md.CreateProduct)
+	a.PATCH("/products/:id", need(access.CatalogWrite), md.UpdateProduct)
 
 	a.GET("/contracts", need(access.ContractsRead), co.ListContracts)
 	a.POST("/contracts", need(access.ContractsWrite), co.CreateContract)
 	a.GET("/contracts/:id", need(access.ContractsRead), co.GetContract)
 	a.POST("/contracts/:id/activate", need(access.ContractsWrite), co.ActivateContract)
+	a.DELETE("/contracts/:id", need(access.ContractsWrite), co.DeleteContract)
 
 	a.POST("/contracts/:id/purchase-orders", need(access.ProcurementWrite), co.CreatePurchaseOrder)
 	a.GET("/purchase-orders/:id", need(access.ContractsRead), co.GetPurchaseOrder)
 	a.POST("/purchase-orders/:id/confirm", need(access.ProcurementWrite), co.ConfirmPurchaseOrder)
+	a.POST("/purchase-orders/:id/cancel", need(access.ProcurementWrite), co.CancelPurchaseOrder)
 
 	a.POST("/purchase-orders/:id/goods-receipts", need(access.FulfillmentWrite), co.CreateGoodsReceipt)
 	a.POST("/goods-receipts/:id/confirm", need(access.FulfillmentConfirm), co.ConfirmGoodsReceipt)
+	a.POST("/goods-receipts/:id/cancel", need(access.FulfillmentWrite), co.CancelGoodsReceipt)
 
 	a.POST("/contracts/:id/delivery-orders", need(access.FulfillmentWrite), co.CreateDeliveryOrder)
 	a.POST("/delivery-orders/:id/confirm", need(access.FulfillmentConfirm), co.ConfirmDeliveryOrder)
+	a.POST("/delivery-orders/:id/cancel", need(access.FulfillmentWrite), co.CancelDeliveryOrder)
 
 	a.GET("/contracts/:id/documents", need(access.ContractsRead), co.ContractDocuments)
 	a.GET("/purchase-orders", need(access.ContractsRead), co.ListPurchaseOrders)

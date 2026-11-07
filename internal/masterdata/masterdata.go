@@ -42,13 +42,7 @@ type organizationInput struct {
 	TaxCode    *string `json:"tax_code"`
 }
 
-// CreateOrganization handles POST /organizations.
-func (h *Handlers) CreateOrganization(c *gin.Context) {
-	var in organizationInput
-	if err := httpx.Decode(c, &in); err != nil {
-		response.Fail(c, err)
-		return
-	}
+func (in *organizationInput) validate() error {
 	in.Code = strings.ToUpper(strings.TrimSpace(in.Code))
 	in.Name = strings.TrimSpace(in.Name)
 	var errs apperrors.FieldErrors
@@ -69,7 +63,17 @@ func (h *Handlers) CreateOrganization(c *gin.Context) {
 	if in.TaxCode != nil && *in.TaxCode == "" {
 		in.TaxCode = nil
 	}
-	if err := errs.Err(); err != nil {
+	return errs.Err()
+}
+
+// CreateOrganization handles POST /organizations.
+func (h *Handlers) CreateOrganization(c *gin.Context) {
+	var in organizationInput
+	if err := httpx.Decode(c, &in); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	if err := in.validate(); err != nil {
 		response.Fail(c, err)
 		return
 	}
@@ -137,13 +141,7 @@ type productInput struct {
 	Unit             string  `json:"unit"`
 }
 
-// CreateProduct handles POST /products.
-func (h *Handlers) CreateProduct(c *gin.Context) {
-	var in productInput
-	if err := httpx.Decode(c, &in); err != nil {
-		response.Fail(c, err)
-		return
-	}
+func (in *productInput) validate() error {
 	in.Name, in.Unit = strings.TrimSpace(in.Name), strings.TrimSpace(in.Unit)
 	var errs apperrors.FieldErrors
 	if in.Name == "" {
@@ -157,7 +155,17 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 		errs.Add("unit", "too_long", map[string]any{"max": 20})
 	}
 	in.Manufacturer, in.ManufacturerCode = blankToNil(in.Manufacturer), blankToNil(in.ManufacturerCode)
-	if err := errs.Err(); err != nil {
+	return errs.Err()
+}
+
+// CreateProduct handles POST /products.
+func (h *Handlers) CreateProduct(c *gin.Context) {
+	var in productInput
+	if err := httpx.Decode(c, &in); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	if err := in.validate(); err != nil {
 		response.Fail(c, err)
 		return
 	}
@@ -215,4 +223,91 @@ func blankToNil(s *string) *string {
 		return nil
 	}
 	return &t
+}
+
+// UpdateOrganization handles PATCH /organizations/:id. Documents keep the names they
+// were made with; a partner still used as customer (contracts) or supplier (orders)
+// keeps that role.
+func (h *Handlers) UpdateOrganization(c *gin.Context) {
+	id, err := httpx.PathID(c, "id")
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	var in organizationInput
+	if err := httpx.Decode(c, &in); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	if err := in.validate(); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	httpx.Command(c, h.Pool, "organizations.update", false, 200, func(tx pgx.Tx) (any, error) {
+		ctx := c.Request.Context()
+		var before Organization
+		if err := tx.QueryRow(ctx, `SELECT id, code, name, is_customer, is_supplier, tax_code FROM organizations WHERE id = $1 FOR UPDATE`, id).
+			Scan(&before.ID, &before.Code, &before.Name, &before.IsCustomer, &before.IsSupplier, &before.TaxCode); err != nil {
+			return nil, err
+		}
+		var usedAsCustomer, usedAsSupplier bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM contracts WHERE customer_id = $1), EXISTS (SELECT 1 FROM purchase_orders WHERE supplier_id = $1)`, id).
+			Scan(&usedAsCustomer, &usedAsSupplier); err != nil {
+			return nil, err
+		}
+		var errs apperrors.FieldErrors
+		if usedAsCustomer && !in.IsCustomer {
+			errs.Add("is_customer", "in_use", nil)
+		}
+		if usedAsSupplier && !in.IsSupplier {
+			errs.Add("is_supplier", "in_use", nil)
+		}
+		if err := errs.Err(); err != nil {
+			return nil, err
+		}
+		o := Organization{ID: id, Code: in.Code, Name: in.Name, IsCustomer: in.IsCustomer, IsSupplier: in.IsSupplier, TaxCode: in.TaxCode}
+		if _, err := tx.Exec(ctx, `UPDATE organizations SET code = $2, name = $3, is_customer = $4, is_supplier = $5, tax_code = $6,
+				version = version + 1, updated_at = now() WHERE id = $1`, id, o.Code, o.Name, o.IsCustomer, o.IsSupplier, o.TaxCode); err != nil {
+			if appErr := apperrors.From(err); appErr.Reason == "duplicate" {
+				return nil, apperrors.Invalid("code", "taken", nil)
+			}
+			return nil, err
+		}
+		return o, audit.Record(ctx, tx, "update", "organization", id, map[string]any{"before": before, "after": o})
+	})
+}
+
+// UpdateProduct handles PATCH /products/:id; documents keep their own snapshot (BR-01).
+func (h *Handlers) UpdateProduct(c *gin.Context) {
+	id, err := httpx.PathID(c, "id")
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	var in productInput
+	if err := httpx.Decode(c, &in); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	if err := in.validate(); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	httpx.Command(c, h.Pool, "products.update", false, 200, func(tx pgx.Tx) (any, error) {
+		ctx := c.Request.Context()
+		var before Product
+		if err := tx.QueryRow(ctx, `SELECT id, name, manufacturer, manufacturer_code, unit FROM products WHERE id = $1 FOR UPDATE`, id).
+			Scan(&before.ID, &before.Name, &before.Manufacturer, &before.ManufacturerCode, &before.Unit); err != nil {
+			return nil, err
+		}
+		p := Product{ID: id, Name: in.Name, Manufacturer: in.Manufacturer, ManufacturerCode: in.ManufacturerCode, Unit: in.Unit}
+		if _, err := tx.Exec(ctx, `UPDATE products SET name = $2, manufacturer = $3, manufacturer_code = $4, unit = $5,
+				version = version + 1, updated_at = now() WHERE id = $1`, id, p.Name, p.Manufacturer, p.ManufacturerCode, p.Unit); err != nil {
+			if appErr := apperrors.From(err); appErr.Reason == "duplicate" {
+				return nil, apperrors.Invalid("manufacturer_code", "taken", nil)
+			}
+			return nil, err
+		}
+		return p, audit.Record(ctx, tx, "update", "product", id, map[string]any{"before": before, "after": p})
+	})
 }
