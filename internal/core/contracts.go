@@ -19,6 +19,7 @@ import (
 	"navo-api/internal/decimalx"
 	"navo-api/internal/httpx"
 	"navo-api/internal/numbering"
+	"navo-api/internal/progress"
 	"navo-api/internal/response"
 )
 
@@ -38,20 +39,41 @@ type Contract struct {
 	OwnerID           uuid.UUID `json:"owner_id"`
 	OwnerName         string    `json:"owner_name"`
 	Version           int64     `json:"version"`
-	Lines             []LineRow `json:"lines,omitempty"`
-	Summary           *Summary  `json:"summary,omitempty"`
+	DeliveryLocation  *string   `json:"delivery_location"`
+	// Value is the sum of quantity × unit price (sales prices, visible with the contract).
+	Value      string    `json:"value"`
+	FinalDueOn *string   `json:"final_due_on"`
+	Lines      []LineRow `json:"lines,omitempty"`
+	Summary    *Summary  `json:"summary,omitempty"`
+	// List view only (active contracts): delivery progress and what needs attention.
+	Progress  *Summary           `json:"progress,omitempty"`
+	Attention *ContractAttention `json:"attention,omitempty"`
+}
+
+// ContractAttention is the contract list's "needs attention" cell: the most
+// severe flag over its lines, the line it belongs to, and how many lines need action.
+type ContractAttention struct {
+	Count int            `json:"count"`
+	Flag  *progress.Flag `json:"flag"`
+	Line  string         `json:"line_name,omitempty"`
+	Unit  string         `json:"unit,omitempty"`
 }
 
 const contractSelect = `SELECT c.id, c.number, c.draft_number, c.status, c.customer_id, o.code, o.name, c.title,
-	c.customer_reference, c.currency, c.signed_on, c.owner_id, u.full_name, c.version
+	c.customer_reference, c.currency, c.signed_on, c.owner_id, u.full_name, c.version, c.delivery_location,
+	(SELECT coalesce(round(sum(cl.quantity * cl.unit_price), 2), 0)::text FROM contract_lines cl WHERE cl.contract_id = c.id),
+	(SELECT max(cl.due_on) FROM contract_lines cl WHERE cl.contract_id = c.id)
 	FROM contracts c JOIN organizations o ON o.id = c.customer_id JOIN users u ON u.id = c.owner_id`
 
 func scanContract(row pgx.Row) (Contract, error) {
 	var k Contract
-	var signed *time.Time
+	var signed, finalDue *time.Time
 	err := row.Scan(&k.ID, &k.Number, &k.DraftNumber, &k.Status, &k.CustomerID, &k.CustomerCode, &k.CustomerName, &k.Title,
-		&k.CustomerReference, &k.Currency, &signed, &k.OwnerID, &k.OwnerName, &k.Version)
-	k.SignedOn = dateString(signed)
+		&k.CustomerReference, &k.Currency, &signed, &k.OwnerID, &k.OwnerName, &k.Version, &k.DeliveryLocation, &k.Value, &finalDue)
+	k.SignedOn, k.FinalDueOn = dateString(signed), dateString(finalDue)
+	if err == nil {
+		k.Value = decimalx.MustParse(k.Value).String()
+	}
 	return k, err
 }
 
@@ -83,6 +105,7 @@ type contractInput struct {
 	CustomerID        string              `json:"customer_id"`
 	Title             string              `json:"title"`
 	CustomerReference *string             `json:"customer_reference"`
+	DeliveryLocation  *string             `json:"delivery_location"`
 	Currency          string              `json:"currency"`
 	OwnerID           *string             `json:"owner_id"`
 	Lines             []contractLineInput `json:"lines"`
@@ -126,6 +149,10 @@ func (h *Handlers) CreateContract(c *gin.Context) {
 		} else {
 			in.CustomerReference = &ref
 		}
+	}
+	in.DeliveryLocation = trimmed(in.DeliveryLocation)
+	if in.DeliveryLocation != nil && len([]rune(*in.DeliveryLocation)) > 300 {
+		errs.Add("delivery_location", "too_long", map[string]any{"max": 300})
 	}
 	owner := p.UserID
 	if in.OwnerID != nil && *in.OwnerID != "" {
@@ -186,9 +213,9 @@ func (h *Handlers) CreateContract(c *gin.Context) {
 			return nil, err
 		}
 		var id uuid.UUID
-		if err := tx.QueryRow(ctx, `INSERT INTO contracts (draft_number, customer_id, title, customer_reference, currency, owner_id, created_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-			numbering.DraftNumber(seq), customerID, in.Title, in.CustomerReference, in.Currency, owner, p.UserID).Scan(&id); err != nil {
+		if err := tx.QueryRow(ctx, `INSERT INTO contracts (draft_number, customer_id, title, customer_reference, currency, owner_id, created_by, delivery_location)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+			numbering.DraftNumber(seq), customerID, in.Title, in.CustomerReference, in.Currency, owner, p.UserID, in.DeliveryLocation).Scan(&id); err != nil {
 			return nil, err
 		}
 		for i, l := range lines {
@@ -252,46 +279,175 @@ func (h *Handlers) GetContract(c *gin.Context) {
 	response.OK(c, k)
 }
 
-// ListContracts handles GET /contracts?status=&q=&page=.
+// ListContracts handles GET /contracts?tab=action|soon|all|draft&status=&q=&customer_id=&owner_id=&page=.
+// The tabs follow the contract list screen (S-03): active contracts needing action,
+// with a delivery planned in the next 7 days, or all; drafts on their own. Counts for
+// every tab come back with the page so the tab labels stay right while filtering.
 func (h *Handlers) ListContracts(c *gin.Context) {
+	ctx := c.Request.Context()
 	p := auth.Principal(c)
 	page, size := httpx.Page(c)
 	q := strings.TrimSpace(c.Query("q"))
-	rows, err := h.Pool.Query(c.Request.Context(), contractSelect+`
-		WHERE ($1::uuid IS NULL OR c.owner_id = $1) AND ($2 = '' OR c.status = $2)
+	var errs apperrors.FieldErrors
+	customer := optionalUUID(&errs, "customer_id", c.Query("customer_id"))
+	ownerParam := optionalUUID(&errs, "owner_id", c.Query("owner_id"))
+	tab := c.Query("tab")
+	if tab != "" && tab != "action" && tab != "soon" && tab != "all" && tab != "draft" {
+		errs.Add("tab", "one_of", map[string]any{"values": []string{"action", "soon", "all", "draft"}})
+	}
+	if err := errs.Err(); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	owner := p.OwnerFilter()
+	if owner == nil {
+		owner = ownerParam // only people who see everyone can narrow to one owner
+	}
+	statuses := []string{"draft", "active", "closed", "cancelled"}
+	if tab != "" {
+		statuses = []string{"draft", "active"}
+	} else if s := c.Query("status"); s != "" {
+		statuses = []string{s}
+	}
+	rows, err := h.Pool.Query(ctx, contractSelect+`
+		WHERE ($1::uuid IS NULL OR c.owner_id = $1) AND c.status = ANY($2) AND ($4::uuid IS NULL OR c.customer_id = $4)
 		  AND ($3 = '' OR c.number ILIKE '%' || $3 || '%' OR c.draft_number ILIKE '%' || $3 || '%' OR c.title ILIKE '%' || $3 || '%'
 		       OR o.name ILIKE '%' || $3 || '%' OR o.code ILIKE '%' || $3 || '%' OR c.customer_reference ILIKE '%' || $3 || '%')
-		ORDER BY (c.status = 'active') DESC, c.number DESC NULLS LAST, c.created_at DESC, c.id
-		LIMIT $4 OFFSET $5`, p.OwnerFilter(), c.Query("status"), q, size, (page-1)*size)
+		ORDER BY (c.status = 'active') DESC, c.number DESC NULLS LAST, c.created_at DESC, c.id`, owner, statuses, q, customer)
 	if err != nil {
 		response.Fail(c, err)
 		return
 	}
-	items := []Contract{}
-	for rows.Next() {
-		k, err := scanContract(rows)
-		if err != nil {
-			rows.Close()
-			response.Fail(c, err)
-			return
+	all, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Contract, error) { return scanContract(r) })
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	lines, err := QueryLines(ctx, h.Pool, owner, nil, h.today())
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	type agg struct {
+		rows []LineRow
+		soon bool
+	}
+	byContract := map[uuid.UUID]*agg{}
+	soonUntil := h.today().AddDate(0, 0, 7).Format(time.DateOnly)
+	for _, l := range lines {
+		a := byContract[l.ContractID]
+		if a == nil {
+			a = &agg{}
+			byContract[l.ContractID] = a
 		}
-		items = append(items, k)
+		a.rows = append(a.rows, l)
+		if l.NextDelivery != nil && l.NextDelivery.PlannedOn <= soonUntil {
+			a.soon = true
+		}
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	counts := map[string]int{"action": 0, "soon": 0, "all": 0, "draft": 0}
+	items := []Contract{}
+	for _, k := range all {
+		if k.Status == "active" {
+			a := byContract[k.ID]
+			if a == nil {
+				a = &agg{}
+			}
+			s := summarize(a.rows)
+			k.Progress = &s
+			k.Attention = contractAttention(a.rows)
+			counts["all"]++
+			if k.Attention.Count > 0 {
+				counts["action"]++
+			}
+			if a.soon {
+				counts["soon"]++
+			}
+			if tab == "" || tab == "all" || (tab == "action" && k.Attention.Count > 0) || (tab == "soon" && a.soon) {
+				items = append(items, k)
+			}
+			continue
+		}
+		if k.Status == "draft" {
+			counts["draft"]++
+		}
+		if tab == "" || tab == "draft" {
+			items = append(items, k)
+		}
+	}
+	start := min((page-1)*size, len(items))
+	end := min(start+size, len(items))
+	response.ListCounts(c, items[start:end], page, size, len(items), counts)
+}
+
+// contractAttention summarises a contract's lines for the list: the most severe
+// flag (critical, then warning, info, done) and how many lines need action.
+func contractAttention(rows []LineRow) *ContractAttention {
+	out := &ContractAttention{}
+	best := 99
+	for _, r := range rows {
+		action := false
+		for i := range r.Flags {
+			f := r.Flags[i]
+			if f.Severity == progress.Critical || f.Severity == progress.Warning {
+				action = true
+			}
+			if rk := flagRank(f.Severity); rk < best {
+				best, out.Flag, out.Line, out.Unit = rk, &f, r.NameOnContract, r.Unit
+			}
+		}
+		if action {
+			out.Count++
+		}
+	}
+	return out
+}
+
+func flagRank(s progress.Severity) int {
+	switch s {
+	case progress.Critical:
+		return 0
+	case progress.Warning:
+		return 1
+	case progress.Info:
+		return 2
+	}
+	return 3
+}
+
+func optionalUUID(errs *apperrors.FieldErrors, field, raw string) *uuid.UUID {
+	if raw == "" {
+		return nil
+	}
+	id, err := uuid.Parse(raw)
+	if err != nil {
+		errs.Add(field, "uuid", nil)
+		return nil
+	}
+	return &id
+}
+
+// Owner is someone responsible for contracts (the owner filter).
+type Owner struct {
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
+}
+
+// ListOwners handles GET /contracts/owners: people who own contracts the caller can see.
+func (h *Handlers) ListOwners(c *gin.Context) {
+	p := auth.Principal(c)
+	rows, err := h.Pool.Query(c.Request.Context(), `SELECT DISTINCT u.id, u.full_name FROM contracts c JOIN users u ON u.id = c.owner_id
+		WHERE ($1::uuid IS NULL OR c.owner_id = $1) ORDER BY u.full_name, u.id`, p.OwnerFilter())
+	if err != nil {
 		response.Fail(c, err)
 		return
 	}
-	var total int
-	if err := h.Pool.QueryRow(c.Request.Context(), `SELECT count(*) FROM contracts c JOIN organizations o ON o.id = c.customer_id
-		WHERE ($1::uuid IS NULL OR c.owner_id = $1) AND ($2 = '' OR c.status = $2)
-		  AND ($3 = '' OR c.number ILIKE '%' || $3 || '%' OR c.draft_number ILIKE '%' || $3 || '%' OR c.title ILIKE '%' || $3 || '%'
-		       OR o.name ILIKE '%' || $3 || '%' OR o.code ILIKE '%' || $3 || '%' OR c.customer_reference ILIKE '%' || $3 || '%')`,
-		p.OwnerFilter(), c.Query("status"), q).Scan(&total); err != nil {
+	owners, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Owner])
+	if err != nil {
 		response.Fail(c, err)
 		return
 	}
-	response.List(c, items, page, size, total)
+	response.OK(c, owners)
 }
 
 type activateInput struct {

@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"navo-api/internal/auth"
+	"navo-api/internal/decimalx"
 	"navo-api/internal/httpx"
 	"navo-api/internal/progress"
 	"navo-api/internal/response"
@@ -49,6 +50,10 @@ type Upcoming struct {
 	PlannedOn      string    `json:"planned_on"`
 	Firmness       string    `json:"firmness"`
 	Lines          int       `json:"lines"`
+	// With a single line: what is delivered, so the list can say "Gioăng DN100 · 80 cái".
+	ItemName *string `json:"item_name"`
+	Quantity *string `json:"quantity"`
+	Unit     *string `json:"unit"`
 }
 
 // Overview is the dashboard of one user's scope (REQUIREMENTS 9.2 S-01).
@@ -59,8 +64,10 @@ type Overview struct {
 	POsAwaitingGoods int            `json:"purchase_orders_awaiting_goods"`
 	FlagCounts       map[string]int `json:"flag_counts"`
 	NeedsAction      int            `json:"needs_action"`
-	Attention        []LineRow      `json:"attention"`
-	Upcoming         []Upcoming     `json:"upcoming"`
+	// Attention lists lines needing action (critical/warning) and, after them,
+	// lines still to be ordered from suppliers; most severe first, at most 200.
+	Attention []LineRow  `json:"attention"`
+	Upcoming  []Upcoming `json:"upcoming"`
 }
 
 // ReportOverview handles GET /reports/overview.
@@ -80,21 +87,19 @@ func (h *Handlers) ReportOverview(c *gin.Context) {
 		if r.Remaining.IsPositive() {
 			o.LinesRemaining++
 		}
-		action := false
 		for _, f := range r.Flags {
 			o.FlagCounts[f.Code]++
-			if f.Severity == progress.Critical || f.Severity == progress.Warning {
-				action = true
-			}
 		}
-		if action {
+		if NeedsAction(r) {
+			o.NeedsAction++
+			attention = append(attention, r)
+		} else if hasFlag(r, "under_ordered") {
 			attention = append(attention, r)
 		}
 	}
-	o.NeedsAction = len(attention)
 	sort.SliceStable(attention, func(i, j int) bool { return severityRank(attention[i]) < severityRank(attention[j]) })
-	if len(attention) > 5 {
-		attention = attention[:5]
+	if len(attention) > 200 {
+		attention = attention[:200]
 	}
 	o.Attention = append(o.Attention, attention...)
 	if err := h.Pool.QueryRow(ctx, `SELECT
@@ -131,7 +136,10 @@ func severityRank(r LineRow) int {
 
 func upcoming(ctx context.Context, h *Handlers, owner *uuid.UUID, today time.Time) ([]Upcoming, error) {
 	rows, err := h.Pool.Query(ctx, `SELECT d.id, d.number, c.id, c.number, o.name, d.planned_on, d.firmness,
-			(SELECT count(*) FROM delivery_order_lines WHERE delivery_order_id = d.id)
+			(SELECT count(*) FROM delivery_order_lines WHERE delivery_order_id = d.id),
+			(SELECT cl.name_on_contract FROM delivery_order_lines dol JOIN contract_lines cl ON cl.id = dol.contract_line_id WHERE dol.delivery_order_id = d.id LIMIT 1),
+			(SELECT dol.quantity::text FROM delivery_order_lines dol WHERE dol.delivery_order_id = d.id LIMIT 1),
+			(SELECT cl.unit FROM delivery_order_lines dol JOIN contract_lines cl ON cl.id = dol.contract_line_id WHERE dol.delivery_order_id = d.id LIMIT 1)
 		FROM delivery_orders d JOIN contracts c ON c.id = d.contract_id JOIN organizations o ON o.id = c.customer_id
 		WHERE d.status = 'draft' AND d.planned_on BETWEEN $2 AND $2 + 7 AND ($1::uuid IS NULL OR c.owner_id = $1)
 		ORDER BY d.planned_on, d.number LIMIT 10`, owner, today)
@@ -143,8 +151,14 @@ func upcoming(ctx context.Context, h *Handlers, owner *uuid.UUID, today time.Tim
 	for rows.Next() {
 		var u Upcoming
 		var on time.Time
-		if err := rows.Scan(&u.ID, &u.Number, &u.ContractID, &u.ContractNumber, &u.CustomerName, &on, &u.Firmness, &u.Lines); err != nil {
+		if err := rows.Scan(&u.ID, &u.Number, &u.ContractID, &u.ContractNumber, &u.CustomerName, &on, &u.Firmness, &u.Lines, &u.ItemName, &u.Quantity, &u.Unit); err != nil {
 			return nil, err
+		}
+		if u.Lines != 1 {
+			u.ItemName, u.Quantity, u.Unit = nil, nil, nil
+		} else if u.Quantity != nil {
+			q := decimalx.MustParse(*u.Quantity).String()
+			u.Quantity = &q
 		}
 		u.PlannedOn = on.Format(time.DateOnly)
 		out = append(out, u)

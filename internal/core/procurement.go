@@ -32,6 +32,7 @@ type PurchaseOrder struct {
 	SupplierName   string        `json:"supplier_name"`
 	Status         string        `json:"status"`
 	Currency       string        `json:"currency"`
+	ConfirmedOn    *string       `json:"confirmed_on"`
 	Lines          []POLine      `json:"lines"`
 	Override       *OverrideInfo `json:"override"`
 }
@@ -53,13 +54,16 @@ type POLine struct {
 
 func loadPO(ctx context.Context, q db.Querier, id uuid.UUID, p *access.Principal) (*PurchaseOrder, error) {
 	var po PurchaseOrder
-	err := q.QueryRow(ctx, `SELECT po.id, po.number, po.contract_id, c.number, po.supplier_id, s.name, po.status, po.currency
+	var confirmed *time.Time
+	err := q.QueryRow(ctx, `SELECT po.id, po.number, po.contract_id, c.number, po.supplier_id, s.name, po.status, po.currency,
+			(po.confirmed_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date
 		FROM purchase_orders po JOIN contracts c ON c.id = po.contract_id JOIN organizations s ON s.id = po.supplier_id
 		WHERE po.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2)`, id, p.OwnerFilter()).
-		Scan(&po.ID, &po.Number, &po.ContractID, &po.ContractNumber, &po.SupplierID, &po.SupplierName, &po.Status, &po.Currency)
+		Scan(&po.ID, &po.Number, &po.ContractID, &po.ContractNumber, &po.SupplierID, &po.SupplierName, &po.Status, &po.Currency, &confirmed)
 	if err != nil {
 		return nil, err
 	}
+	po.ConfirmedOn = dateString(confirmed)
 	if po.Override, err = latestOverride(ctx, q, "purchase_order", id); err != nil {
 		return nil, err
 	}

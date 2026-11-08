@@ -68,6 +68,8 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	a.PATCH("/products/:id", need(access.CatalogWrite), md.UpdateProduct)
 
 	a.GET("/contracts", need(access.ContractsRead), co.ListContracts)
+	a.GET("/contracts/owners", need(access.ContractsRead), co.ListOwners)
+	a.GET("/search", need(access.ContractsRead), co.Search)
 	a.POST("/contracts", need(access.ContractsWrite), co.CreateContract)
 	a.GET("/contracts/:id", need(access.ContractsRead), co.GetContract)
 	a.POST("/contracts/:id/activate", need(access.ContractsWrite), co.ActivateContract)

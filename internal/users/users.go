@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/mail"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -31,6 +32,8 @@ type User struct {
 	IsActive bool      `json:"is_active"`
 	Roles    []string  `json:"roles"`
 	Grants   []string  `json:"grants"`
+	// LastSignInAt is when the user last signed in (any device), nil if never.
+	LastSignInAt *time.Time `json:"last_sign_in_at"`
 }
 
 // Input creates a user.
@@ -136,6 +139,7 @@ func (h *Handlers) ListUsers(c *gin.Context) {
 	rows, err := h.Pool.Query(c.Request.Context(), `SELECT u.id, u.email, u.full_name, u.is_active,
 			coalesce((SELECT array_agg(role ORDER BY role) FROM user_roles WHERE user_id = u.id), '{}'),
 			coalesce((SELECT array_agg(grant_code ORDER BY grant_code) FROM user_grants WHERE user_id = u.id), '{}'),
+			(SELECT max(created_at) FROM sessions WHERE user_id = u.id),
 			count(*) OVER ()
 		FROM users u ORDER BY u.full_name, u.id LIMIT $1 OFFSET $2`, size, (page-1)*size)
 	if err != nil {
@@ -147,7 +151,7 @@ func (h *Handlers) ListUsers(c *gin.Context) {
 	total := 0
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.Email, &u.FullName, &u.IsActive, &u.Roles, &u.Grants, &total); err != nil {
+		if err := rows.Scan(&u.ID, &u.Email, &u.FullName, &u.IsActive, &u.Roles, &u.Grants, &u.LastSignInAt, &total); err != nil {
 			response.Fail(c, err)
 			return
 		}
