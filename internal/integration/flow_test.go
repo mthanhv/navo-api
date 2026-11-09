@@ -67,7 +67,7 @@ func setup(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	loc, _ := time.LoadLocation("Asia/Ho_Chi_Minh")
-	srv := httptest.NewServer(router.New(config.Config{SessionTTL: time.Hour, Timezone: loc}, pool))
+	srv := httptest.NewServer(router.New(config.Config{SessionTTL: time.Hour, Timezone: loc, FilesDir: t.TempDir()}, pool))
 	t.Cleanup(func() { srv.Close(); pool.Close() })
 	return &env{t: t, srv: srv, pool: pool}
 }

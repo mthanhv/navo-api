@@ -39,6 +39,8 @@ const (
 	// Sensitive grants: never implied by a role title, granted one by one.
 	PurchaseCostRead Permission = "purchase_cost.read"
 	FinanceRead      Permission = "finance.read"
+	// FinanceWrite records invoices, receipts, payments and MISA exports (accounting).
+	FinanceWrite     Permission = "finance.write"
 	QuantityOverride Permission = "quantity.override"
 )
 
@@ -48,7 +50,7 @@ var Grantable = map[Permission]bool{PurchaseCostRead: true, FinanceRead: true, Q
 var roleDefaults = map[Role][]Permission{
 	Sales:      {ContractsRead, ContractsWrite, ProcurementWrite, FulfillmentWrite, FulfillmentConfirm, PartnersWrite, CatalogWrite, ReportsOperations},
 	Leader:     {ContractsRead, ReportsOperations},
-	Accounting: {ContractsRead, PurchaseCostRead, FinanceRead},
+	Accounting: {ContractsRead, PurchaseCostRead, FinanceRead, FinanceWrite},
 	Admin:      {UsersManage, QuantityOverride},
 }
 

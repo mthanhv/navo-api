@@ -17,13 +17,20 @@ type Config struct {
 	CookieSecure   bool
 	AllowedOrigins []string
 	Timezone       *time.Location
+	FilesDir       string
+	// AnthropicAPIKey enables AI drafts (O-17); empty keeps the feature off.
+	AnthropicAPIKey string
+	AIModel         string
 }
 
 // Load reads the environment.
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:        envOr("NAVO_ADDR", ":8080"),
-		DatabaseURL: os.Getenv("DATABASE_URL"),
+		Addr:            envOr("NAVO_ADDR", ":8080"),
+		DatabaseURL:     os.Getenv("DATABASE_URL"),
+		FilesDir:        envOr("NAVO_FILES_DIR", "var/files"),
+		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
+		AIModel:         envOr("NAVO_AI_MODEL", "claude-opus-5-5"),
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")
