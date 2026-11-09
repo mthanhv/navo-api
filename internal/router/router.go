@@ -14,6 +14,7 @@ import (
 	"navo-api/internal/auth"
 	"navo-api/internal/config"
 	"navo-api/internal/core"
+	"navo-api/internal/crm"
 	"navo-api/internal/documents"
 	"navo-api/internal/files"
 	"navo-api/internal/finance"
@@ -132,9 +133,19 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	a.POST("/payments", need(access.FinanceWrite), fin.CreatePayment)
 
 	// AI drafts (5.10, O-17): read a customer's file into a contract draft to check.
-	aiH := &ai.Handlers{Pool: pool, AI: ai.New(cfg.AnthropicAPIKey, cfg.AIModel)}
+	aiH := &ai.Handlers{Pool: pool, AI: ai.New(cfg.AnthropicAPIKey, cfg.AIModel), TZ: cfg.Timezone}
 	a.GET("/ai/status", need(access.ContractsRead), aiH.Status)
 	a.POST("/ai/contract-draft", need(access.ContractsWrite), aiH.ContractDraft)
+	a.POST("/ai/note-parse", need(access.ContractsRead), aiH.NoteParse)
+
+	// Field notes and follow-up tasks (5.10).
+	crmH := &crm.Handlers{Pool: pool}
+	a.POST("/notes", need(access.ContractsRead), crmH.CreateNote)
+	a.GET("/notes", need(access.ContractsRead), crmH.ListNotes)
+	a.GET("/tasks", crmH.MyTasks)
+	a.POST("/tasks", crmH.CreateTask)
+	a.POST("/tasks/:id/done", crmH.SetTaskDone(true))
+	a.POST("/tasks/:id/reopen", crmH.SetTaskDone(false))
 
 	// MISA SME exchange (5.11): accounting only.
 	ms := &misa.Handlers{Pool: pool}

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/gabriel-vasile/mimetype"
@@ -24,6 +25,7 @@ import (
 type Handlers struct {
 	Pool *pgxpool.Pool
 	AI   *Extractor
+	TZ   *time.Location
 }
 
 // Status handles GET /ai/status so the web shows or hides "Đọc từ file".

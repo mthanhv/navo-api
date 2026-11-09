@@ -15,6 +15,7 @@ const (
 	OwnerPurchaseInvoice = "purchase_invoice"
 	OwnerReceipt         = "receipt"
 	OwnerPayment         = "payment"
+	OwnerNote            = "note"
 )
 
 // kind describes one document kind: where it may be attached, who may see it, and
@@ -43,7 +44,7 @@ var kinds = map[string]kind{
 	"cq":                    {owners: []string{OwnerPurchaseOrder, OwnerGoodsReceipt, OwnerDeliveryOrder}, ascii: "CQ"},
 	"delivery_note":         {owners: []string{OwnerDeliveryOrder}, ascii: "BienBanGiaoNhan"},
 	"acceptance":            {owners: []string{OwnerDeliveryOrder}, ascii: "BienBanNghiemThu"},
-	"photo":                 {owners: []string{OwnerContract, OwnerGoodsReceipt, OwnerDeliveryOrder}, ascii: "Anh"},
+	"photo":                 {owners: []string{OwnerContract, OwnerGoodsReceipt, OwnerDeliveryOrder, OwnerNote}, ascii: "Anh"},
 	"sales_invoice":         {owners: []string{OwnerSalesInvoice}, need: access.FinanceRead, ascii: "HoaDonBan"},
 	"bank":                  {owners: []string{OwnerReceipt, OwnerPayment}, need: access.FinanceRead, ascii: "ChungTuNganHang"},
 	"other":                 {owners: []string{OwnerCustomer, OwnerContract, OwnerPurchaseOrder, OwnerGoodsReceipt, OwnerDeliveryOrder, OwnerSalesInvoice, OwnerPurchaseInvoice, OwnerReceipt, OwnerPayment}, ascii: "Khac"},
