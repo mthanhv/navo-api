@@ -29,6 +29,7 @@ var kinds = map[string]kind{
 	"signed_contract":       {owners: []string{OwnerContract}, ascii: "HopDong"},
 	"amendment":             {owners: []string{OwnerContract}, ascii: "PhuLuc"},
 	"quotation":             {owners: []string{OwnerContract}, ascii: "BaoGia"},
+	"customer_order":        {owners: []string{OwnerContract}, ascii: "DonHangKhach"},
 	"minutes":               {owners: []string{OwnerContract, OwnerCustomer}, ascii: "BienBan"},
 	"correspondence":        {owners: []string{OwnerContract, OwnerCustomer}, ascii: "ThuTu"},
 	"profile":               {owners: []string{OwnerCustomer}, ascii: "HoSoNangLuc"},
@@ -84,7 +85,7 @@ func allowed(ownerType, docKind string) bool {
 
 // KindsFor lists the kinds that may be attached to an owner type (for the upload form).
 func KindsFor(ownerType string) []string {
-	order := []string{"signed_contract", "amendment", "quotation", "po_signed", "supplier_confirmation", "supplier_invoice", "receipt_note",
+	order := []string{"signed_contract", "amendment", "quotation", "customer_order", "po_signed", "supplier_confirmation", "supplier_invoice", "receipt_note",
 		"packing_list", "co", "cq", "delivery_note", "acceptance", "sales_invoice", "bank", "photo", "minutes", "correspondence", "profile", "nda", "other"}
 	out := []string{}
 	for _, k := range order {

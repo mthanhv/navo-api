@@ -267,13 +267,13 @@ func (h *Handlers) contractDocs(ctx context.Context, p *access.Principal, id uui
 	// 1 and 6: files on the contract itself, split by kind.
 	var main, other []FileItem
 	for _, f := range contractLevel {
-		if f.Kind == "signed_contract" || f.Kind == "amendment" || f.Kind == "quotation" {
+		if f.Kind == "signed_contract" || f.Kind == "amendment" || f.Kind == "quotation" || f.Kind == "customer_order" {
 			main = append(main, f)
 		} else {
 			other = append(other, f)
 		}
 	}
-	s1 := Section{Key: "contract", Label: "1. Hợp đồng & phụ lục", Groups: []Group{{OwnerType: OwnerContract, OwnerID: id, Files: nonNil(main), Kinds: []string{"signed_contract", "amendment", "quotation"}}}}
+	s1 := Section{Key: "contract", Label: "1. Hợp đồng & phụ lục", Groups: []Group{{OwnerType: OwnerContract, OwnerID: id, Files: nonNil(main), Kinds: []string{"signed_contract", "amendment", "quotation", "customer_order"}}}}
 	if cd.Status == "active" && !has(main, "signed_contract") {
 		s1.Warn = "missing_signed_contract"
 	}
