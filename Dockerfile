@@ -9,10 +9,13 @@ ARG VERSION=dev
 RUN set -eu; for cmd in api migrate navo-user navo-seed; do \
       CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/$cmd ./cmd/$cmd; \
     done; \
-    mv /out/api /out/navo-api; mv /out/migrate /out/navo-migrate
+    mv /out/api /out/navo-api; mv /out/migrate /out/navo-migrate; mkdir -p /files
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/ /usr/local/bin/
+# Uploaded files (mount a volume here); owned by the non-root user so it can write.
+COPY --from=build --chown=65532:65532 /files /var/lib/navo/files
+ENV NAVO_FILES_DIR=/var/lib/navo/files
 USER nonroot:nonroot
 EXPOSE 8080
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=4 CMD ["/usr/local/bin/navo-api", "healthcheck"]
