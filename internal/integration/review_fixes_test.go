@@ -145,3 +145,46 @@ func TestContactOwnership(t *testing.T) {
 		t.Fatalf("an edit without owner_id keeps the owner: %v", kept)
 	}
 }
+
+// A contract's history shows who did what to it and its documents, newest first, with the
+// person's own reason, within scope and without the raw audit payload (which can hold prices).
+func TestContractHistory(t *testing.T) {
+	e := setup(t)
+	e.user("khoa@test.vn", []string{"sales"})
+	e.user("ha@test.vn", []string{"sales"})
+	e.user("lan@test.vn", []string{"leader"})
+	khoa, ha, lan := e.login("khoa@test.vn"), e.login("ha@test.vn"), e.login("lan@test.vn")
+	f := e.activeContract(khoa, "HIS", "10")
+	po := e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/purchase-orders", map[string]any{"supplier_id": f.supplier, "currency": "VND",
+		"lines": []any{map[string]any{"contract_line_id": f.line, "quantity": "10", "unit_price": "777"}}}, nil), "po")["id"].(string)
+	e.must(200, e.do(khoa, "POST", "/api/v1/purchase-orders/"+po+"/confirm", nil, key("his-c")), "confirm")
+	e.must(200, e.do(khoa, "POST", "/api/v1/purchase-orders/"+po+"/close", map[string]any{"reason": "NCC hết hàng"}, key("his-close")), "close")
+
+	r := e.do(lan, "GET", "/api/v1/contracts/"+f.contract+"/history", nil, nil)
+	if r.Status != 200 {
+		t.Fatalf("history: %d %v", r.Status, r.Body)
+	}
+	got := r.Body["data"].([]any)
+	seen := map[string]bool{}
+	for _, x := range got {
+		m := x.(map[string]any)
+		seen[m["action"].(string)+":"+m["entity_type"].(string)] = true
+		if m["action"] == "close_outstanding" && (m["detail"] != "NCC hết hàng" || m["actor"] != "khoa@test.vn") {
+			t.Fatalf("the close shows who and why: %v", m)
+		}
+		if _, leaked := m["changes"]; leaked {
+			t.Fatal("the raw audit payload is never returned")
+		}
+	}
+	for _, want := range []string{"create:contract", "activate:contract", "create:purchase_order", "confirm:purchase_order", "close_outstanding:purchase_order"} {
+		if !seen[want] {
+			t.Fatalf("history misses %s: %v", want, got)
+		}
+	}
+	if first := got[0].(map[string]any); first["action"] != "close_outstanding" {
+		t.Fatalf("newest first: %v", first)
+	}
+	if r := e.do(ha, "GET", "/api/v1/contracts/"+f.contract+"/history", nil, nil); r.Status != 404 {
+		t.Fatalf("another salesperson cannot read this contract's history: %d", r.Status)
+	}
+}

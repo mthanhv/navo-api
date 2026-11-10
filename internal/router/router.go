@@ -96,6 +96,7 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	a.POST("/contracts", need(access.ContractsWrite), co.CreateContract)
 	a.GET("/contracts/:id", need(access.ContractsRead), co.GetContract)
 	a.GET("/contracts/:id/draft", need(access.ContractsWrite), co.DraftContractInput)
+	a.GET("/contracts/:id/history", need(access.ContractsRead), co.ContractHistory)
 	a.PATCH("/contracts/:id", need(access.ContractsWrite), co.UpdateDraftContract)
 	a.POST("/contracts/:id/activate", need(access.ContractsWrite), co.ActivateContract)
 	a.DELETE("/contracts/:id", need(access.ContractsWrite), co.DeleteContract)

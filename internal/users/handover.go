@@ -177,6 +177,12 @@ func (h *Handlers) Handover(c *gin.Context) {
 		if err := tx.QueryRow(ctx, `INSERT INTO handovers(from_user,to_user,reason,scope,created_by) VALUES($1,$2,$3,$4,$5) RETURNING id`, from, to, in.Reason, gin.H{"contracts": ids, "tasks": tasks}, auth.Principal(c).UserID).Scan(&id); err != nil {
 			return nil, err
 		}
+		// Each contract's own history shows the change of owner and why.
+		for _, cid := range ids {
+			if err := audit.Record(ctx, tx, "handover", "contract", cid, map[string]any{"from": from, "to": to, "reason": in.Reason, "handover_id": id}); err != nil {
+				return nil, err
+			}
+		}
 		return gin.H{"id": id, "contracts": len(ids), "tasks": len(tasks)}, audit.Record(ctx, tx, "handover", "user", from, map[string]any{"to": to, "reason": in.Reason, "handover_id": id, "contracts": ids, "tasks": tasks})
 	})
 }
