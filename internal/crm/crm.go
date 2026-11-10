@@ -115,18 +115,46 @@ func (h *Handlers) CreateNote(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	var existing uuid.UUID
-	if err := h.Pool.QueryRow(ctx, `SELECT id FROM notes WHERE client_id = $1 AND author_id = $2`, clientID, p.UserID).Scan(&existing); err == nil {
-		n, err := h.loadNote(ctx, h.Pool, existing)
-		if err != nil {
-			response.Fail(c, err)
-			return
-		}
-		response.OK(c, n)
-		return
-	}
 	var id uuid.UUID
+	replayed := false
 	err := db.InTx(ctx, h.Pool, func(tx pgx.Tx) error {
+		// Serialize the client identity before looking up the prior result. A
+		// response lost after commit must replay, including concurrent retries.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "note:"+clientID.String()); err != nil {
+			return err
+		}
+		var author uuid.UUID
+		err := tx.QueryRow(ctx, `SELECT id,author_id FROM notes WHERE client_id=$1`, clientID).Scan(&id, &author)
+		if err == nil {
+			if author != p.UserID {
+				return apperrors.Conflict("note_exists", "This client identity is already in use.", nil)
+			}
+			prior, err := h.loadNote(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			sameContract := prior.ContractID == nil && contract == nil || prior.ContractID != nil && contract != nil && *prior.ContractID == *contract
+			sameTask := in.Task == nil && len(prior.Tasks) == 0
+			if in.Task != nil && len(prior.Tasks) == 1 {
+				due := ""
+				if taskDue != nil {
+					due = taskDue.Format(time.DateOnly)
+				}
+				previousDue := ""
+				if prior.Tasks[0].DueOn != nil {
+					previousDue = *prior.Tasks[0].DueOn
+				}
+				sameTask = prior.Tasks[0].Title == in.Task.Title && due == previousDue
+			}
+			if prior.CustomerID != customer || !sameContract || prior.Body != in.Body || !sameTask || in.WrittenAt != nil && *in.WrittenAt != "" && !prior.WrittenAt.Truncate(time.Microsecond).Equal(written.Truncate(time.Microsecond)) {
+				return apperrors.Conflict("idempotency_key_reused", "This note was already sent with different content. Keep the original and create a new note for changes.", nil)
+			}
+			replayed = true
+			return nil
+		}
+		if err != pgx.ErrNoRows {
+			return err
+		}
 		var isCustomer bool
 		if err := tx.QueryRow(ctx, `SELECT is_customer FROM organizations WHERE id = $1`, customer).Scan(&isCustomer); err != nil || !isCustomer {
 			return apperrors.Invalid("customer_id", "not_customer", nil)
@@ -160,6 +188,11 @@ func (h *Handlers) CreateNote(c *gin.Context) {
 	n, err := h.loadNote(ctx, h.Pool, id)
 	if err != nil {
 		response.Fail(c, err)
+		return
+	}
+	if replayed {
+		c.Header("Idempotent-Replayed", "true")
+		response.OK(c, n)
 		return
 	}
 	c.JSON(201, gin.H{"request_id": c.GetString("request_id"), "status": 201, "success": true, "data": n})
@@ -293,6 +326,21 @@ func (h *Handlers) CreateTask(c *gin.Context) {
 	}
 	httpx.Command(c, h.Pool, "tasks.create", false, httpx.Created, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
+		if contract != nil {
+			var customerID uuid.UUID
+			if err := tx.QueryRow(ctx, `SELECT customer_id FROM contracts WHERE id = $1 AND ($2::uuid IS NULL OR owner_id = $2)`, *contract, p.OwnerFilter()).Scan(&customerID); err != nil {
+				return nil, err
+			}
+			if customer != nil && *customer != customerID {
+				return nil, apperrors.Invalid("customer_id", "not_in_contract", nil)
+			}
+			customer = &customerID
+		} else if customer != nil {
+			var isCustomer bool
+			if err := tx.QueryRow(ctx, `SELECT is_customer FROM organizations WHERE id = $1`, *customer).Scan(&isCustomer); err != nil || !isCustomer {
+				return nil, apperrors.Invalid("customer_id", "not_customer", nil)
+			}
+		}
 		var id uuid.UUID
 		if err := tx.QueryRow(ctx, `INSERT INTO tasks (title, due_on, owner_id, customer_id, contract_id, created_by) VALUES ($1, $2, $3, $4, $5, $3) RETURNING id`,
 			in.Title, due, p.UserID, customer, contract).Scan(&id); err != nil {
@@ -302,7 +350,7 @@ func (h *Handlers) CreateTask(c *gin.Context) {
 		if err != nil || len(ts) == 0 {
 			return nil, err
 		}
-		return ts[0], nil
+		return ts[0], audit.Record(ctx, tx, "create", "task", id, map[string]any{"title": in.Title, "customer_id": customer, "contract_id": contract})
 	})
 }
 
@@ -315,21 +363,23 @@ func (h *Handlers) SetTaskDone(done bool) gin.HandlerFunc {
 			response.Fail(c, err)
 			return
 		}
-		ctx := c.Request.Context()
-		tag, err := h.Pool.Exec(ctx, `UPDATE tasks SET done_at = CASE WHEN $3 THEN coalesce(done_at, now()) END WHERE id = $1 AND owner_id = $2`, id, p.UserID, done)
-		if err != nil {
-			response.Fail(c, err)
-			return
-		}
-		if tag.RowsAffected() == 0 {
-			response.Fail(c, apperrors.NotFound())
-			return
-		}
-		ts, err := h.tasks(ctx, h.Pool, `t.id = $1`, id)
-		if err != nil || len(ts) == 0 {
-			response.Fail(c, err)
-			return
-		}
-		response.OK(c, ts[0])
+		httpx.Command(c, h.Pool, "tasks.state", false, 200, func(tx pgx.Tx) (any, error) {
+			ctx := c.Request.Context()
+			tag, err := tx.Exec(ctx, `UPDATE tasks SET done_at = CASE WHEN $3 THEN coalesce(done_at, now()) END WHERE id = $1 AND owner_id = $2`, id, p.UserID, done)
+			if err != nil {
+				return nil, err
+			}
+			if tag.RowsAffected() == 0 {
+				return nil, apperrors.NotFound()
+			}
+			ts, err := h.tasks(ctx, tx, `t.id = $1`, id)
+			if err != nil {
+				return nil, err
+			}
+			if len(ts) == 0 {
+				return nil, apperrors.NotFound()
+			}
+			return ts[0], audit.Record(ctx, tx, "state", "task", id, map[string]any{"done": done})
+		})
 	}
 }

@@ -14,6 +14,7 @@ type key int
 const (
 	requestIDKey key = iota
 	actorKey
+	authorizationKey
 )
 
 var validRequestID = regexp.MustCompile(`^[A-Za-z0-9._:-]{8,128}$`)
@@ -47,4 +48,15 @@ func WithActor(ctx context.Context, id uuid.UUID) context.Context {
 func Actor(ctx context.Context) uuid.UUID {
 	id, _ := ctx.Value(actorKey).(uuid.UUID)
 	return id
+}
+
+// WithAuthorization binds stored command results to the current access revision.
+func WithAuthorization(ctx context.Context, fingerprint []byte) context.Context {
+	return context.WithValue(ctx, authorizationKey, fingerprint)
+}
+
+// Authorization returns the access fingerprint set by authentication.
+func Authorization(ctx context.Context) []byte {
+	b, _ := ctx.Value(authorizationKey).([]byte)
+	return b
 }

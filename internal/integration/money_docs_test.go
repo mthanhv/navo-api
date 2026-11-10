@@ -16,9 +16,16 @@ import (
 )
 
 func (e *env) upload(token, ownerType, ownerID, kind, name string, content []byte) result {
+	return e.uploadClient(token, ownerType, ownerID, kind, name, content, "")
+}
+
+func (e *env) uploadClient(token, ownerType, ownerID, kind, name string, content []byte, clientID string) result {
 	e.t.Helper()
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
+	if clientID != "" {
+		_ = w.WriteField("client_id", clientID)
+	}
 	_ = w.WriteField("owner_type", ownerType)
 	_ = w.WriteField("owner_id", ownerID)
 	_ = w.WriteField("doc_kind", kind)
@@ -174,6 +181,14 @@ func TestReceivablesAndAllocation(t *testing.T) {
 	if e.must(200, e.do(mai, "GET", "/api/v1/receipts/"+rid, nil, nil), "receipt again")["unallocated"] != "100000000" {
 		t.Fatal("a retried allocation is recorded once")
 	}
+	// Acceptance requires complete delivery and an evidence reference.
+	sup := e.must(201, e.do(khoa, "POST", "/api/v1/organizations", map[string]any{"code": "FINSUP", "name": "Supplier", "is_supplier": true}, nil), "supplier")
+	po := e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+kid+"/purchase-orders", map[string]any{"supplier_id": sup["id"], "currency": "VND", "lines": []any{map[string]any{"contract_line_id": lineByNo(k, 1)["contract_line_id"], "quantity": "10", "unit_price": "1"}}}, nil), "finance PO")
+	e.must(200, e.do(khoa, "POST", "/api/v1/purchase-orders/"+po["id"].(string)+"/confirm", nil, key("fpo")), "finance PO confirm")
+	gr := e.must(201, e.do(khoa, "POST", "/api/v1/purchase-orders/"+po["id"].(string)+"/goods-receipts", map[string]any{"received_on": "2026-10-19", "lines": []any{map[string]any{"purchase_order_line_id": po["lines"].([]any)[0].(map[string]any)["id"], "accepted_quantity": "10"}}}, nil), "finance GR")
+	e.must(200, e.do(khoa, "POST", "/api/v1/goods-receipts/"+gr["id"].(string)+"/confirm", nil, key("fgr")), "finance GR confirm")
+	delivery := e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+kid+"/delivery-orders", map[string]any{"lines": []any{map[string]any{"contract_line_id": lineByNo(k, 1)["contract_line_id"], "quantity": "10"}}}, nil), "finance DO")
+	e.must(200, e.do(khoa, "POST", "/api/v1/delivery-orders/"+delivery["id"].(string)+"/confirm", map[string]any{"delivered_on": "2026-10-20"}, key("fdo")), "finance DO confirm")
 	e.must(200, e.do(khoa, "POST", "/api/v1/milestones/"+acc["id"].(string)+"/trigger", map[string]any{"on": "2026-10-20", "note": "Biên bản nghiệm thu 20/10"}, key("t")), "acceptance")
 	got = e.must(200, e.do(mai, "POST", "/api/v1/receipts/"+rid+"/allocations", map[string]any{"allocations": []any{map[string]any{"milestone_id": acc["id"], "amount": "100000000"}}}, key("ok2")), "allocate 2")
 	if got["unallocated"] != "0" {

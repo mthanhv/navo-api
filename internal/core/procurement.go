@@ -40,16 +40,17 @@ type PurchaseOrder struct {
 // POLine references exactly one line of the same contract. UnitPrice is the
 // purchase price and is omitted without purchase_cost.read (never just hidden by the client).
 type POLine struct {
-	ID               uuid.UUID        `json:"id"`
-	ContractLineID   uuid.UUID        `json:"contract_line_id"`
-	ContractLineNo   int              `json:"contract_line_no"`
-	NameOnContract   string           `json:"name_on_contract"`
-	SupplierItemName *string          `json:"supplier_item_name"`
-	Unit             string           `json:"unit"`
-	Quantity         decimal.Decimal  `json:"quantity"`
-	UnitPrice        *decimal.Decimal `json:"unit_price,omitempty"`
-	ExpectedOn       *string          `json:"expected_on"`
-	Received         decimal.Decimal  `json:"received"`
+	ID                uuid.UUID        `json:"id"`
+	ContractLineID    uuid.UUID        `json:"contract_line_id"`
+	ContractLineNo    int              `json:"contract_line_no"`
+	NameOnContract    string           `json:"name_on_contract"`
+	SupplierItemName  *string          `json:"supplier_item_name"`
+	Unit              string           `json:"unit"`
+	Quantity          decimal.Decimal  `json:"quantity"`
+	CancelledQuantity decimal.Decimal  `json:"cancelled_quantity"`
+	UnitPrice         *decimal.Decimal `json:"unit_price,omitempty"`
+	ExpectedOn        *string          `json:"expected_on"`
+	Received          decimal.Decimal  `json:"received"`
 }
 
 func loadPO(ctx context.Context, q db.Querier, id uuid.UUID, p *access.Principal) (*PurchaseOrder, error) {
@@ -68,7 +69,7 @@ func loadPO(ctx context.Context, q db.Querier, id uuid.UUID, p *access.Principal
 		return nil, err
 	}
 	rows, err := q.Query(ctx, `SELECT pol.id, pol.contract_line_id, cl.line_no, cl.name_on_contract, pol.supplier_item_name, cl.unit,
-			pol.quantity::text, pol.unit_price::text, pol.expected_on,
+			(pol.quantity-pol.cancelled_quantity)::text, pol.unit_price::text, pol.expected_on, pol.cancelled_quantity::text,
 			coalesce((SELECT sum(grl.accepted_quantity) FROM goods_receipt_lines grl JOIN goods_receipts gr ON gr.id = grl.goods_receipt_id
 			          WHERE grl.purchase_order_line_id = pol.id AND gr.status = 'confirmed'), 0)::text
 		FROM purchase_order_lines pol JOIN contract_lines cl ON cl.id = pol.contract_line_id
@@ -81,12 +82,13 @@ func loadPO(ctx context.Context, q db.Querier, id uuid.UUID, p *access.Principal
 	po.Lines = []POLine{}
 	for rows.Next() {
 		var l POLine
-		var qty, price, received string
+		var qty, price, received, cancelled string
 		var expected *time.Time
 		if err := rows.Scan(&l.ID, &l.ContractLineID, &l.ContractLineNo, &l.NameOnContract, &l.SupplierItemName, &l.Unit,
-			&qty, &price, &expected, &received); err != nil {
+			&qty, &price, &expected, &cancelled, &received); err != nil {
 			return nil, err
 		}
+		l.CancelledQuantity = decimalx.MustParse(cancelled)
 		l.Quantity, l.Received, l.ExpectedOn = decimalx.MustParse(qty), decimalx.MustParse(received), dateString(expected)
 		if seeCost {
 			v := decimalx.MustParse(price)
@@ -314,7 +316,7 @@ func lockLinesFor(ctx context.Context, tx pgx.Tx, sql string, docID uuid.UUID) (
 
 func orderedSoFar(ctx context.Context, q db.Querier, lineID uuid.UUID) (decimal.Decimal, error) {
 	var s string
-	err := q.QueryRow(ctx, `SELECT coalesce(sum(pol.quantity), 0)::text FROM purchase_order_lines pol
+	err := q.QueryRow(ctx, `SELECT coalesce(sum(pol.quantity-pol.cancelled_quantity), 0)::text FROM purchase_order_lines pol
 		JOIN purchase_orders po ON po.id = pol.purchase_order_id WHERE pol.contract_line_id = $1 AND po.status = 'confirmed'`, lineID).Scan(&s)
 	if err != nil {
 		return decimal.Zero, err

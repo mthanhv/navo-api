@@ -66,6 +66,7 @@ type Principal struct {
 	Email   string    `json:"email"`
 	Roles   []Role    `json:"roles"`
 	Granted []string  `json:"grants"`
+	Version int64     `json:"-"`
 	perms   map[Permission]bool
 	seesAll bool
 }

@@ -80,7 +80,7 @@ func (h *Handlers) ContractDraft(c *gin.Context) {
 	if i := strings.IndexByte(mt, ';'); i > 0 {
 		mt = mt[:i]
 	}
-	draft, err := h.AI.Extract(ctx, mt, data)
+	draft, err := h.extractCached(ctx, mt, data)
 	if err != nil {
 		response.Fail(c, err)
 		return

@@ -8,8 +8,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -197,7 +199,11 @@ func (s *Service) Authenticate() gin.HandlerFunc {
 			return
 		}
 		c.Set(principalKey, p)
-		c.Request = c.Request.WithContext(reqctx.WithActor(ctx, userID))
+		perms := p.Permissions()
+		sort.Slice(perms, func(i, j int) bool { return perms[i] < perms[j] })
+		encoded, _ := json.Marshal([]any{p.Version, perms, p.OwnerFilter()})
+		fingerprint := sha256.Sum256(encoded)
+		c.Request = c.Request.WithContext(reqctx.WithAuthorization(reqctx.WithActor(ctx, userID), fingerprint[:]))
 		c.Next()
 	}
 }
@@ -205,10 +211,11 @@ func (s *Service) Authenticate() gin.HandlerFunc {
 func (s *Service) loadPrincipal(ctx context.Context, userID uuid.UUID) (*access.Principal, error) {
 	var name, email string
 	var roles, grants []string
-	err := s.Pool.QueryRow(ctx, `SELECT u.full_name, u.email,
+	var version int64
+	err := s.Pool.QueryRow(ctx, `SELECT u.full_name, u.email, u.version,
 			coalesce((SELECT array_agg(role ORDER BY role) FROM user_roles WHERE user_id = u.id), '{}'),
 			coalesce((SELECT array_agg(grant_code ORDER BY grant_code) FROM user_grants WHERE user_id = u.id), '{}')
-		FROM users u WHERE u.id = $1`, userID).Scan(&name, &email, &roles, &grants)
+		FROM users u WHERE u.id = $1`, userID).Scan(&name, &email, &version, &roles, &grants)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +223,9 @@ func (s *Service) loadPrincipal(ctx context.Context, userID uuid.UUID) (*access.
 	for i, r := range roles {
 		rs[i] = access.Role(r)
 	}
-	return access.NewPrincipal(userID, name, email, rs, grants), nil
+	p := access.NewPrincipal(userID, name, email, rs, grants)
+	p.Version = version
+	return p, nil
 }
 
 // Principal returns the signed-in user; Authenticate must have run.

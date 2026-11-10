@@ -77,8 +77,10 @@ Field codes: `required`, `too_long`, `format`, `decimal`, `greater_than`, `less_
 `over_ordered` (warning); `under_ordered` (info); `completed`. Window for `stock_short` is
 `company_settings.alert_horizon_days` (default 14).
 
-## Not yet built (next increments)
+## Current workflows and limits
 
-Returns and reversals, acceptance,
-amendments, finance (invoices, receipts/payments, allocations), files and documents tree,
-CRM notes/tasks, MISA export, AI drafts, OpenAPI file and backup runbook.
+Implemented: contract drafts/activation and draft editing; PO/GR/DO creation, confirmation and quantity approvals; full GR/DO reversal and closing outstanding PO quantities; versioned payment terms, evidenced full-delivery acceptance, invoices, receipts/payments and reversible allocations; scoped files/ZIP, notes/tasks, contacts/mailings, MISA code exchange and frozen export files, AI-assisted drafts, and selected assignment handover.
+
+See [reliability and API details](docs/RELIABILITY.md), [assessment baseline](docs/PRODUCT_REVIEW_2026-11-10.md), and [remediation status and release limits](docs/REMEDIATION.md).
+
+Partial physical returns, active commercial amendments, contract close/cancel, opening-data onboarding/import, real-MISA template acceptance, and a maintained OpenAPI schema remain incomplete. Do not infer these from status columns or historical requirements. There is no subscription billing or tenant model: one business uses each installation.

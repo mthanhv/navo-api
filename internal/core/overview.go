@@ -171,7 +171,7 @@ func (h *Handlers) ReportOverview(c *gin.Context) {
 			(SELECT count(DISTINCT po.id) FROM purchase_orders po JOIN contracts c ON c.id = po.contract_id
 			 JOIN purchase_order_lines pol ON pol.purchase_order_id = po.id
 			 WHERE po.status = 'confirmed' AND ($1::uuid IS NULL OR c.owner_id = $1)
-			   AND pol.quantity > coalesce((SELECT sum(grl.accepted_quantity) FROM goods_receipt_lines grl
+			   AND (pol.quantity-pol.cancelled_quantity) > coalesce((SELECT sum(grl.accepted_quantity) FROM goods_receipt_lines grl
 			       JOIN goods_receipts gr ON gr.id = grl.goods_receipt_id WHERE grl.purchase_order_line_id = pol.id AND gr.status = 'confirmed'), 0))`,
 		owner).Scan(&o.ActiveContracts, &o.POsAwaitingGoods); err != nil {
 		response.Fail(c, err)

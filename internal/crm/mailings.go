@@ -2,7 +2,9 @@ package crm
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net/textproto"
 	"strings"
 	"time"
 
@@ -59,6 +61,7 @@ type Mailing struct {
 	Total      int              `json:"total"`
 	Sent       int              `json:"sent"`
 	Failed     int              `json:"failed"`
+	Unknown    int              `json:"unknown"`
 	Products   []MailingProduct `json:"products,omitempty"`
 	Recipients []Recipient      `json:"recipients,omitempty"`
 }
@@ -268,8 +271,8 @@ func (h *Handlers) CreateMailing(c *gin.Context) {
 			return nil, err
 		}
 		for i, pr := range products {
-			if _, err := tx.Exec(ctx, `INSERT INTO mailing_products (mailing_id, product_id, position, name, manufacturer, manufacturer_code) VALUES ($1, $2, $3, $4, $5, $6)`,
-				id, pr.ProductID, i+1, pr.Name, pr.Manufacturer, pr.ManufacturerCode); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO mailing_products (mailing_id, product_id, position, name, manufacturer, manufacturer_code, description, origin, snapshot_version) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)`,
+				id, pr.ProductID, i+1, pr.Name, pr.Manufacturer, pr.ManufacturerCode, pr.description, pr.origin); err != nil {
 				return nil, err
 			}
 		}
@@ -328,8 +331,16 @@ func (h *Handlers) deliver(id uuid.UUID, senderName, senderEmail string) {
 	}
 	rows.Close()
 	for _, r := range list {
+		tag, err := h.Pool.Exec(ctx, `UPDATE mailing_recipients SET status='sending' WHERE id=$1 AND status='queued'`, r.id)
+		if err != nil {
+			slog.Error("mailing claim failed", "recipient_id", r.id, "error", err)
+			return
+		}
+		if tag.RowsAffected() != 1 {
+			continue
+		}
 		sendCtx, done := context.WithTimeout(ctx, 45*time.Second)
-		err := h.Mail.Send(sendCtx, mailer.Message{ToName: r.name, ToEmail: r.email, ReplyToName: senderName, ReplyToEmail: senderEmail,
+		err = h.Mail.Send(sendCtx, mailer.Message{ToName: r.name, ToEmail: r.email, ReplyToName: senderName, ReplyToEmail: senderEmail,
 			Subject: subject, Text: Compose(r.name, body, products, senderName, senderEmail)})
 		done()
 		if err != nil {
@@ -338,10 +349,21 @@ func (h *Handlers) deliver(id uuid.UUID, senderName, senderEmail string) {
 				msg = msg[:300]
 			}
 			slog.Warn("mailing copy failed", "mailing_id", id, "recipient_id", r.id, "error", msg)
-			_, _ = h.Pool.Exec(ctx, `UPDATE mailing_recipients SET status = 'failed', error = $2 WHERE id = $1`, r.id, msg)
+			status := "unknown"
+			var smtpErr *textproto.Error
+			if errors.As(err, &smtpErr) && smtpErr.Code >= 500 || strings.HasPrefix(msg, "550 ") {
+				status = "failed"
+			}
+			if _, err := h.Pool.Exec(ctx, `UPDATE mailing_recipients SET status = $3, error = $2 WHERE id = $1`, r.id, msg, status); err != nil {
+				slog.Error("mailing outcome not persisted", "recipient_id", r.id, "error", err)
+				return
+			}
 			continue
 		}
-		_, _ = h.Pool.Exec(ctx, `UPDATE mailing_recipients SET status = 'sent', sent_at = now() WHERE id = $1`, r.id)
+		if _, err := h.Pool.Exec(ctx, `UPDATE mailing_recipients SET status = 'sent', sent_at = now() WHERE id = $1`, r.id); err != nil {
+			slog.Error("mailing outcome not persisted", "recipient_id", r.id, "error", err)
+			return
+		}
 	}
 	_, _ = h.Pool.Exec(ctx, `UPDATE mailings SET finished_at = now() WHERE id = $1`, id)
 }
@@ -350,13 +372,15 @@ func (h *Handlers) deliver(id uuid.UUID, senderName, senderEmail string) {
 // shows an email as "sending" forever. Called once at start-up.
 func (h *Handlers) CloseInterrupted(ctx context.Context) {
 	if _, err := h.Pool.Exec(ctx, `WITH stale AS (UPDATE mailings SET finished_at = now() WHERE finished_at IS NULL RETURNING id)
-		UPDATE mailing_recipients r SET status = 'failed', error = 'interrupted' FROM stale WHERE r.mailing_id = stale.id AND r.status = 'queued'`); err != nil {
+		UPDATE mailing_recipients r SET status = CASE WHEN r.status='sending' THEN 'unknown' ELSE 'failed' END, error = 'interrupted' FROM stale WHERE r.mailing_id = stale.id AND r.status IN ('queued','sending')`); err != nil {
 		slog.Warn("closing interrupted mailings failed", "error", err)
 	}
 }
 
 func (h *Handlers) mailingProducts(ctx context.Context, q db.Querier, id uuid.UUID, withDetails bool) ([]MailingProduct, error) {
-	rows, err := q.Query(ctx, `SELECT mp.product_id, mp.name, mp.manufacturer, mp.manufacturer_code, p.description, p.origin
+	rows, err := q.Query(ctx, `SELECT mp.product_id, mp.name, mp.manufacturer, mp.manufacturer_code,
+		CASE WHEN mp.snapshot_version=1 THEN mp.description ELSE p.description END,
+		CASE WHEN mp.snapshot_version=1 THEN mp.origin ELSE p.origin END
 		FROM mailing_products mp JOIN products p ON p.id = mp.product_id WHERE mp.mailing_id = $1 ORDER BY mp.position`, id)
 	if err != nil {
 		return nil, err
@@ -379,11 +403,12 @@ func (h *Handlers) mailingProducts(ctx context.Context, q db.Querier, id uuid.UU
 const mailingSelect = `SELECT m.id, m.subject, m.body, u.full_name, m.created_at, m.finished_at,
 	(SELECT count(*) FROM mailing_recipients r WHERE r.mailing_id = m.id),
 	(SELECT count(*) FROM mailing_recipients r WHERE r.mailing_id = m.id AND r.status = 'sent'),
-	(SELECT count(*) FROM mailing_recipients r WHERE r.mailing_id = m.id AND r.status = 'failed')
+	(SELECT count(*) FROM mailing_recipients r WHERE r.mailing_id = m.id AND r.status = 'failed'),
+	(SELECT count(*) FROM mailing_recipients r WHERE r.mailing_id=m.id AND r.status='unknown')
 	FROM mailings m JOIN users u ON u.id = m.created_by`
 
 func scanMailing(row pgx.Row, m *Mailing, extra ...any) error {
-	return row.Scan(append([]any{&m.ID, &m.Subject, &m.Body, &m.Author, &m.CreatedAt, &m.FinishedAt, &m.Total, &m.Sent, &m.Failed}, extra...)...)
+	return row.Scan(append([]any{&m.ID, &m.Subject, &m.Body, &m.Author, &m.CreatedAt, &m.FinishedAt, &m.Total, &m.Sent, &m.Failed, &m.Unknown}, extra...)...)
 }
 
 // loadMailing returns a mailing with products and recipients; owner limits it to the

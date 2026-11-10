@@ -71,6 +71,9 @@ func (h *Handlers) requestOverride(c *gin.Context, kind string) {
 		errs.Add("reason", "too_long", map[string]any{"max": 1000})
 	}
 	delivered := httpx.Date(&errs, "delivered_on", in.DeliveredOn)
+	if delivered != nil && delivered.After(h.today()) {
+		errs.Add("delivered_on", "not_future", nil)
+	}
 	if kind == "delivery_order" && delivered == nil && len(errs) == 0 {
 		errs.Add("delivered_on", "required", nil)
 	}
@@ -152,7 +155,7 @@ func scanOverride(ctx context.Context, q db.Querier, row pgx.Row) (*OverrideRequ
 	r.DeliveredOn = dateString(delivered)
 	lineSQL := map[string]string{
 		"purchase_order": `SELECT cl.line_no, cl.name_on_contract, cl.unit, cl.quantity::text, pol.quantity::text,
-				coalesce((SELECT sum(x.quantity) FROM purchase_order_lines x JOIN purchase_orders xp ON xp.id = x.purchase_order_id
+				coalesce((SELECT sum(x.quantity-x.cancelled_quantity) FROM purchase_order_lines x JOIN purchase_orders xp ON xp.id = x.purchase_order_id
 				          WHERE x.contract_line_id = cl.id AND xp.status = 'confirmed'), 0)::text
 			FROM purchase_order_lines pol JOIN contract_lines cl ON cl.id = pol.contract_line_id WHERE pol.purchase_order_id = $1 ORDER BY cl.line_no`,
 		"delivery_order": `SELECT cl.line_no, cl.name_on_contract, cl.unit, cl.quantity::text, dol.quantity::text,

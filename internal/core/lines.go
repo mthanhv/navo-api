@@ -66,7 +66,7 @@ WITH lines AS (
     WHERE ($1::uuid IS NULL OR c.owner_id = $1)
       AND (($2::uuid IS NOT NULL AND c.id = $2) OR ($2::uuid IS NULL AND c.status = 'active'))
 ), ordered AS (
-    SELECT pol.contract_line_id, sum(pol.quantity) AS q
+    SELECT pol.contract_line_id, sum(pol.quantity-pol.cancelled_quantity) AS q
     FROM purchase_order_lines pol JOIN purchase_orders po ON po.id = pol.purchase_order_id
     WHERE po.status = 'confirmed' AND pol.contract_line_id IN (SELECT id FROM lines)
     GROUP BY 1
@@ -85,7 +85,7 @@ WITH lines AS (
     FROM purchase_order_lines pol
     JOIN purchase_orders po ON po.id = pol.purchase_order_id
     LEFT JOIN received_by_po_line r ON r.purchase_order_line_id = pol.id
-    WHERE po.status = 'confirmed' AND pol.expected_on < $3 AND coalesce(r.q, 0) < pol.quantity
+    WHERE po.status = 'confirmed' AND pol.expected_on < $3 AND coalesce(r.q, 0) < (pol.quantity-pol.cancelled_quantity)
       AND pol.contract_line_id IN (SELECT id FROM lines)
     GROUP BY 1
 ), delivered AS (

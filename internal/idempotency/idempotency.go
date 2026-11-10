@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"navo-api/internal/apperrors"
+	"navo-api/internal/reqctx"
 )
 
 // Header is the HTTP header carrying the client's key.
@@ -40,8 +41,8 @@ func Begin(ctx context.Context, tx pgx.Tx, actor uuid.UUID, scope, key string, h
 	if l := len(key); l < 8 || l > 128 {
 		return nil, apperrors.Invalid(Header, "idempotency_key", map[string]any{"min": 8, "max": 128})
 	}
-	tag, err := tx.Exec(ctx, `INSERT INTO idempotency_records (actor_id, scope, key, request_hash)
-		VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`, actor, scope, key, hash)
+	tag, err := tx.Exec(ctx, `INSERT INTO idempotency_records (actor_id, scope, key, request_hash, authorization_hash)
+		VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`, actor, scope, key, hash, reqctx.Authorization(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -51,9 +52,13 @@ func Begin(ctx context.Context, tx pgx.Tx, actor uuid.UUID, scope, key string, h
 	var storedHash []byte
 	var status *int
 	var data []byte
-	if err := tx.QueryRow(ctx, `SELECT request_hash, status_code, response FROM idempotency_records
-		WHERE actor_id = $1 AND scope = $2 AND key = $3`, actor, scope, key).Scan(&storedHash, &status, &data); err != nil {
+	var accessHash []byte
+	if err := tx.QueryRow(ctx, `SELECT request_hash, status_code, response, authorization_hash FROM idempotency_records
+		WHERE actor_id = $1 AND scope = $2 AND key = $3`, actor, scope, key).Scan(&storedHash, &status, &data, &accessHash); err != nil {
 		return nil, err
+	}
+	if len(accessHash) == 0 || !bytes.Equal(accessHash, reqctx.Authorization(ctx)) {
+		return nil, apperrors.Conflict("idempotency_authorization_changed", "Your access changed. Reload the document to check its current status.", nil)
 	}
 	if !bytes.Equal(storedHash, hash) {
 		return nil, apperrors.Conflict("idempotency_payload_mismatch", "This retry key was already used for a different request.", nil)

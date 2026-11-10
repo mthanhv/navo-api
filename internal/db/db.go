@@ -31,6 +31,27 @@ func InTx(ctx context.Context, pool *pgxpool.Pool, fn func(pgx.Tx) error) error 
 	return pgx.BeginFunc(ctx, pool, fn)
 }
 
+// Ready accepts later additive migrations but refuses a schema missing anything
+// required by this binary. A DB ping alone is not application readiness.
+func Ready(ctx context.Context, pool *pgxpool.Pool, files fs.FS) error {
+	names, err := fs.Glob(files, "*.sql")
+	if err != nil {
+		return err
+	}
+	versions := make([]string, len(names))
+	for i, name := range names {
+		versions[i] = strings.TrimSuffix(name, ".sql")
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations WHERE version=ANY($1)`, versions).Scan(&count); err != nil {
+		return err
+	}
+	if count != len(versions) {
+		return fmt.Errorf("schema incompatible: %d of %d required migrations", count, len(versions))
+	}
+	return pool.Ping(ctx)
+}
+
 // migrationLockID serialises migration runners (pg_advisory_xact_lock key).
 const migrationLockID = 7_428_001
 

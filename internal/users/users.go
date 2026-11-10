@@ -224,7 +224,7 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 				return nil, apperrors.Forbidden("grant_" + g)
 			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE users SET full_name = $2, is_active = $3, updated_at = now() WHERE id = $1`, id, in.FullName, in.IsActive); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE users SET full_name = $2, is_active = $3, version = version + 1, updated_at = now() WHERE id = $1`, id, in.FullName, in.IsActive); err != nil {
 			return nil, err
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM user_roles WHERE user_id = $1 AND NOT (role = ANY($2))`, id, in.Roles); err != nil {

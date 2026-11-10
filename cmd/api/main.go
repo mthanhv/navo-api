@@ -47,8 +47,10 @@ func run() error {
 		Handler:           router.New(cfg, pool),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		// Synchronous extraction is bounded to 180s. Its result must still fit
+		// within the API, client (240s), and edge (300s) response budgets.
+		WriteTimeout: 230 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 	errCh := make(chan error, 1)
 	go func() {

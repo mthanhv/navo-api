@@ -10,12 +10,14 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"navo-api/db/migrations"
 	"navo-api/internal/access"
 	"navo-api/internal/ai"
 	"navo-api/internal/auth"
 	"navo-api/internal/config"
 	"navo-api/internal/core"
 	"navo-api/internal/crm"
+	"navo-api/internal/db"
 	"navo-api/internal/documents"
 	"navo-api/internal/files"
 	"navo-api/internal/finance"
@@ -51,7 +53,7 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	r.GET("/readyz", func(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 		defer cancel()
-		if err := pool.Ping(ctx); err != nil {
+		if err := db.Ready(ctx, pool, migrations.FS); err != nil {
 			response.Fail(c, err)
 			return
 		}
@@ -78,6 +80,8 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	a.POST("/users", need(access.UsersManage), us.CreateUser)
 	a.PATCH("/users/:id", need(access.UsersManage), us.UpdateUser)
 	a.POST("/users/:id/password", need(access.UsersManage), us.ResetPassword)
+	a.GET("/handovers/preview", need(access.UsersManage), us.HandoverPreview)
+	a.POST("/handovers", need(access.UsersManage), us.Handover)
 
 	a.GET("/organizations", need(access.ContractsRead), md.ListOrganizations)
 	a.POST("/organizations", need(access.PartnersWrite), md.CreateOrganization)
@@ -91,6 +95,8 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	a.GET("/search", need(access.ContractsRead), co.Search)
 	a.POST("/contracts", need(access.ContractsWrite), co.CreateContract)
 	a.GET("/contracts/:id", need(access.ContractsRead), co.GetContract)
+	a.GET("/contracts/:id/draft", need(access.ContractsWrite), co.DraftContractInput)
+	a.PATCH("/contracts/:id", need(access.ContractsWrite), co.UpdateDraftContract)
 	a.POST("/contracts/:id/activate", need(access.ContractsWrite), co.ActivateContract)
 	a.DELETE("/contracts/:id", need(access.ContractsWrite), co.DeleteContract)
 
@@ -98,14 +104,17 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	a.GET("/purchase-orders/:id", need(access.ContractsRead), co.GetPurchaseOrder)
 	a.POST("/purchase-orders/:id/confirm", need(access.ProcurementWrite), co.ConfirmPurchaseOrder)
 	a.POST("/purchase-orders/:id/cancel", need(access.ProcurementWrite), co.CancelPurchaseOrder)
+	a.POST("/purchase-orders/:id/close", need(access.ProcurementWrite), co.ClosePurchaseOrder)
 
 	a.POST("/purchase-orders/:id/goods-receipts", need(access.FulfillmentWrite), co.CreateGoodsReceipt)
 	a.POST("/goods-receipts/:id/confirm", need(access.FulfillmentConfirm), co.ConfirmGoodsReceipt)
 	a.POST("/goods-receipts/:id/cancel", need(access.FulfillmentWrite), co.CancelGoodsReceipt)
+	a.POST("/goods-receipts/:id/reverse", need(access.FulfillmentConfirm), co.ReverseFulfillment("goods_receipt"))
 
 	a.POST("/contracts/:id/delivery-orders", need(access.FulfillmentWrite), co.CreateDeliveryOrder)
 	a.POST("/delivery-orders/:id/confirm", need(access.FulfillmentConfirm), co.ConfirmDeliveryOrder)
 	a.POST("/delivery-orders/:id/cancel", need(access.FulfillmentWrite), co.CancelDeliveryOrder)
+	a.POST("/delivery-orders/:id/reverse", need(access.FulfillmentConfirm), co.ReverseFulfillment("delivery_order"))
 
 	a.GET("/contracts/:id/documents", need(access.ContractsRead), co.ContractDocuments)
 	a.GET("/purchase-orders", need(access.ContractsRead), co.ListPurchaseOrders)
@@ -130,9 +139,11 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	a.PATCH("/milestones/:id", need(access.ContractsRead), fin.UpdateMilestone)
 	a.DELETE("/milestones/:id", need(access.ContractsRead), fin.DeleteMilestone)
 	a.POST("/milestones/:id/trigger", need(access.ContractsRead), fin.TriggerMilestone)
+	a.POST("/milestones/:id/reset", need(access.ContractsRead), fin.ResetMilestone)
 	a.GET("/receivables", need(access.FinanceRead), fin.Receivables)
 	a.GET("/receipts", need(access.FinanceRead), fin.ListReceipts)
 	a.POST("/receipts", need(access.FinanceWrite), fin.CreateReceipt)
+	a.POST("/receipts/:id/reverse", need(access.FinanceWrite), fin.ReverseCash("receipt"))
 	a.GET("/receipts/:id", need(access.FinanceRead), fin.GetReceipt)
 	a.POST("/receipts/:id/allocations", need(access.FinanceWrite), fin.Allocate)
 	a.POST("/allocations/:id/reverse", need(access.FinanceWrite), fin.ReverseAllocation)
@@ -142,6 +153,10 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	a.POST("/invoices/:kind/:id/cancel", need(access.FinanceWrite), fin.CancelInvoice)
 	a.GET("/payments", need(access.FinanceRead), fin.ListPayments)
 	a.POST("/payments", need(access.FinanceWrite), fin.CreatePayment)
+	a.POST("/payments/:id/reverse", need(access.FinanceWrite), fin.ReverseCash("payment"))
+	a.GET("/payments/:id/allocations", need(access.FinanceRead), need(access.PurchaseCostRead), fin.PaymentAllocations)
+	a.POST("/payments/:id/allocations", need(access.FinanceWrite), need(access.PurchaseCostRead), fin.AllocatePayment)
+	a.POST("/payment-allocations/:id/reverse", need(access.FinanceWrite), fin.ReversePaymentAllocation)
 
 	// AI drafts (5.10, O-17): read a customer's file into a contract draft to check.
 	aiH := &ai.Handlers{Pool: pool, AI: ai.New(cfg.AnthropicAPIKey, cfg.AIModel), TZ: cfg.Timezone}
@@ -151,12 +166,12 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 
 	// Field notes and follow-up tasks (5.10).
 	crmH := &crm.Handlers{Pool: pool, Mail: mail}
-	a.POST("/notes", need(access.ContractsRead), crmH.CreateNote)
+	a.POST("/notes", need(access.ContractsWrite), crmH.CreateNote)
 	a.GET("/notes", need(access.ContractsRead), crmH.ListNotes)
 	a.GET("/tasks", crmH.MyTasks)
-	a.POST("/tasks", crmH.CreateTask)
-	a.POST("/tasks/:id/done", crmH.SetTaskDone(true))
-	a.POST("/tasks/:id/reopen", crmH.SetTaskDone(false))
+	a.POST("/tasks", need(access.ContractsWrite), crmH.CreateTask)
+	a.POST("/tasks/:id/done", need(access.ContractsWrite), crmH.SetTaskDone(true))
+	a.POST("/tasks/:id/reopen", need(access.ContractsWrite), crmH.SetTaskDone(false))
 
 	// People at customers and suppliers, and product-news emails to customer contacts.
 	a.GET("/organizations/:id/contacts", need(access.ContractsRead), crmH.ListContacts)

@@ -2,6 +2,7 @@ package finance
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -219,6 +220,16 @@ func (h *Handlers) ListReceipts(c *gin.Context) {
 		args = append(args, id)
 		where = append(where, "r.customer_id = $1")
 	}
+	if period := c.Query("period"); period != "" {
+		start, err := time.Parse("2006-01", period)
+		if err != nil {
+			response.Fail(c, apperrors.Invalid("period", "format", nil))
+			return
+		}
+		n := len(args)
+		args = append(args, start, start.AddDate(0, 1, 0))
+		where = append(where, fmt.Sprintf("r.received_on >= $%d AND r.received_on < $%d", n+1, n+2))
+	}
 	if c.Query("unallocated") == "1" {
 		where = append(where, `r.status = 'posted' AND r.amount > coalesce((SELECT sum(a.amount) FROM receipt_allocations a WHERE a.receipt_id = r.id AND a.reversed_at IS NULL), 0)`)
 	}
@@ -236,6 +247,10 @@ func (h *Handlers) ListReceipts(c *gin.Context) {
 			return
 		}
 		all = append(all, r)
+	}
+	if err := rows.Err(); err != nil {
+		response.Fail(c, err)
+		return
 	}
 	start := min((page-1)*size, len(all))
 	end := min(start+size, len(all))
@@ -289,7 +304,12 @@ func (h *Handlers) Allocate(c *gin.Context) {
 	httpx.Command(c, h.Pool, "receipts.allocate", true, 200, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
 		// Lock the receipt first, then milestones in id order, so concurrent allocations serialize.
-		r, err := scanReceipt(tx.QueryRow(ctx, receiptSelect+` WHERE r.id = $1 FOR UPDATE OF r`, id))
+		if err := tx.QueryRow(ctx, `SELECT id FROM receipts WHERE id = $1 FOR UPDATE`, id).Scan(new(uuid.UUID)); err != nil {
+			return nil, err
+		}
+		// A lock-waiting SELECT retains its original statement snapshot. Read sums
+		// in a new statement after acquiring the lock, not in that SELECT.
+		r, err := scanReceipt(tx.QueryRow(ctx, receiptSelect+` WHERE r.id = $1`, id))
 		if err != nil {
 			return nil, err
 		}

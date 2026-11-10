@@ -97,6 +97,9 @@ func (h *Handlers) CreateGoodsReceipt(c *gin.Context) {
 	}
 	var errs apperrors.FieldErrors
 	receivedOn := httpx.Date(&errs, "received_on", in.ReceivedOn)
+	if receivedOn != nil && receivedOn.After(h.today()) {
+		errs.Add("received_on", "not_future", nil)
+	}
 	if receivedOn == nil && len(errs) == 0 {
 		errs.Add("received_on", "required", nil)
 	}
@@ -132,7 +135,7 @@ func (h *Handlers) CreateGoodsReceipt(c *gin.Context) {
 		var status string
 		var contractID uuid.UUID
 		if err := tx.QueryRow(ctx, `SELECT po.status, po.contract_id FROM purchase_orders po JOIN contracts c ON c.id = po.contract_id
-			WHERE po.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2)`, poID, p.OwnerFilter()).Scan(&status, &contractID); err != nil {
+			WHERE po.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2) FOR UPDATE OF po`, poID, p.OwnerFilter()).Scan(&status, &contractID); err != nil {
 			return nil, err
 		}
 		if status != "confirmed" {
@@ -180,7 +183,7 @@ func (h *Handlers) ConfirmGoodsReceipt(c *gin.Context) {
 		if status != "draft" {
 			return nil, apperrors.Rule("document_not_draft", "Only a draft goods receipt can be confirmed.", map[string]any{"status": status})
 		}
-		rows, err := tx.Query(ctx, `SELECT pol.id, pol.contract_line_id, cl.line_no, pol.quantity::text, grl.accepted_quantity::text
+		rows, err := tx.Query(ctx, `SELECT pol.id, pol.contract_line_id, cl.line_no, (pol.quantity-pol.cancelled_quantity)::text, grl.accepted_quantity::text
 			FROM purchase_order_lines pol JOIN goods_receipt_lines grl ON grl.purchase_order_line_id = pol.id AND grl.goods_receipt_id = $1
 			JOIN contract_lines cl ON cl.id = pol.contract_line_id
 			ORDER BY pol.id FOR UPDATE OF pol`, id)
@@ -403,6 +406,9 @@ func (h *Handlers) ConfirmDeliveryOrder(c *gin.Context) {
 	}
 	var errs apperrors.FieldErrors
 	delivered := httpx.Date(&errs, "delivered_on", in.DeliveredOn)
+	if delivered != nil && delivered.After(h.today()) {
+		errs.Add("delivered_on", "not_future", nil)
+	}
 	if delivered == nil && len(errs) == 0 {
 		errs.Add("delivered_on", "required", nil)
 	}

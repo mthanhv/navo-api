@@ -17,6 +17,7 @@ import (
 	"navo-api/internal/auth"
 	"navo-api/internal/db"
 	"navo-api/internal/decimalx"
+	"navo-api/internal/finance"
 	"navo-api/internal/httpx"
 	"navo-api/internal/numbering"
 	"navo-api/internal/progress"
@@ -102,6 +103,7 @@ type contractLineInput struct {
 }
 
 type contractInput struct {
+	Version           *int64              `json:"version"`
 	CustomerID        string              `json:"customer_id"`
 	Title             string              `json:"title"`
 	CustomerReference *string             `json:"customer_reference"`
@@ -109,6 +111,7 @@ type contractInput struct {
 	Currency          string              `json:"currency"`
 	OwnerID           *string             `json:"owner_id"`
 	Lines             []contractLineInput `json:"lines"`
+	Milestones        []finance.DraftTerm `json:"milestones"`
 }
 
 type parsedLine struct {
@@ -122,7 +125,21 @@ type parsedLine struct {
 }
 
 // CreateContract handles POST /contracts (a draft; numbered when activated).
-func (h *Handlers) CreateContract(c *gin.Context) {
+func (h *Handlers) CreateContract(c *gin.Context) { h.saveContract(c, false) }
+
+// UpdateDraftContract edits the draft before any operational documents can reference its lines.
+func (h *Handlers) UpdateDraftContract(c *gin.Context) { h.saveContract(c, true) }
+
+func (h *Handlers) saveContract(c *gin.Context, editing bool) {
+	var editingID uuid.UUID
+	if editing {
+		var err error
+		editingID, err = httpx.PathID(c, "id")
+		if err != nil {
+			response.Fail(c, err)
+			return
+		}
+	}
 	p := auth.Principal(c)
 	var in contractInput
 	if err := httpx.Decode(c, &in); err != nil {
@@ -189,8 +206,58 @@ func (h *Handlers) CreateContract(c *gin.Context) {
 		response.Fail(c, apperrors.Forbidden("assign_owner"))
 		return
 	}
-	httpx.Command(c, h.Pool, "contracts.create", false, httpx.Created, func(tx pgx.Tx) (any, error) {
+	scope, status := "contracts.create", httpx.Created
+	if editing {
+		scope, status = "contracts.update_draft", 200
+	}
+	httpx.Command(c, h.Pool, scope, false, status, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
+		if editing {
+			k, err := lockContract(ctx, tx, editingID, p, true)
+			if err != nil {
+				return nil, err
+			}
+			if k.Status != "draft" {
+				return nil, apperrors.Rule("contract_not_draft", "Only drafts can be edited. Use a commercial amendment for an active contract.", nil)
+			}
+			var version int64
+			if err := tx.QueryRow(ctx, `SELECT version FROM contracts WHERE id=$1`, editingID).Scan(&version); err != nil {
+				return nil, err
+			}
+			if in.Version == nil || *in.Version != version {
+				return nil, apperrors.Conflict("version_conflict", "This draft changed. Reload before editing.", nil)
+			}
+			if in.OwnerID == nil {
+				owner = k.OwnerID
+			}
+			// Customer and currency are shared by notes, evidence and payment
+			// terms. Require those records to be resolved before changing their basis.
+			var oldCustomer uuid.UUID
+			var oldCurrency string
+			if err := tx.QueryRow(ctx, `SELECT customer_id,currency FROM contracts WHERE id=$1`, editingID).Scan(&oldCustomer, &oldCurrency); err != nil {
+				return nil, err
+			}
+			var dependent bool
+			if oldCustomer != customerID {
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM notes WHERE contract_id=$1) OR EXISTS(SELECT 1 FROM attachment_links WHERE contract_id=$1)`, editingID).Scan(&dependent); err != nil {
+					return nil, err
+				}
+				if dependent {
+					return nil, apperrors.Rule("draft_has_dependents", "This draft already has notes or evidence. Resolve them before changing its customer.", nil)
+				}
+			}
+			if oldCurrency != in.Currency {
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM payment_milestones WHERE contract_id=$1)`, editingID).Scan(&dependent); err != nil {
+					return nil, err
+				}
+				if dependent {
+					return nil, apperrors.Rule("draft_has_dependents", "Remove payment terms before changing this draft's currency.", nil)
+				}
+			}
+			if len(in.Milestones) > 0 {
+				return nil, apperrors.Invalid("milestones", "edit_terms_separately", nil)
+			}
+		}
 		var isCustomer bool
 		if err := tx.QueryRow(ctx, `SELECT is_customer FROM organizations WHERE id = $1`, customerID).Scan(&isCustomer); err != nil || !isCustomer {
 			return nil, apperrors.Invalid("customer_id", "not_customer", nil)
@@ -208,16 +275,26 @@ func (h *Handlers) CreateContract(c *gin.Context) {
 		if err := lineErrs.Err(); err != nil {
 			return nil, err
 		}
-		seq, err := numbering.NextYearly(ctx, tx, "DRAFT", 0)
-		if err != nil {
-			return nil, err
-		}
-		var id uuid.UUID
-		if err := tx.QueryRow(ctx, `INSERT INTO contracts (draft_number, customer_id, title, customer_reference, currency, owner_id, created_by, delivery_location)
+		id := editingID
+		if editing {
+			if _, err := tx.Exec(ctx, `UPDATE contracts SET customer_id=$2,title=$3,customer_reference=$4,currency=$5,owner_id=$6,delivery_location=$7,version=version+1,updated_at=now() WHERE id=$1`, id, customerID, in.Title, in.CustomerReference, in.Currency, owner, in.DeliveryLocation); err != nil {
+				return nil, err
+			}
+			if _, err := tx.Exec(ctx, `DELETE FROM contract_lines WHERE contract_id=$1`, id); err != nil {
+				return nil, err
+			}
+		} else {
+			seq, err := numbering.NextYearly(ctx, tx, "DRAFT", 0)
+			if err != nil {
+				return nil, err
+			}
+			if err := tx.QueryRow(ctx, `INSERT INTO contracts (draft_number, customer_id, title, customer_reference, currency, owner_id, created_by, delivery_location)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-			numbering.DraftNumber(seq), customerID, in.Title, in.CustomerReference, in.Currency, owner, p.UserID, in.DeliveryLocation).Scan(&id); err != nil {
-			return nil, err
+				numbering.DraftNumber(seq), customerID, in.Title, in.CustomerReference, in.Currency, owner, p.UserID, in.DeliveryLocation).Scan(&id); err != nil {
+				return nil, err
+			}
 		}
+
 		for i, l := range lines {
 			prod := products[l.productID]
 			name, unit := prod.name, prod.unit
@@ -232,7 +309,14 @@ func (h *Handlers) CreateContract(c *gin.Context) {
 				return nil, err
 			}
 		}
-		if err := audit.Record(ctx, tx, "create", "contract", id, map[string]any{"title": in.Title, "customer_id": customerID,
+		if err := finance.CreateDraftTerms(ctx, tx, id, p.UserID, in.Milestones); err != nil {
+			return nil, err
+		}
+		action := "create"
+		if editing {
+			action = "update_draft"
+		}
+		if err := audit.Record(ctx, tx, action, "contract", id, map[string]any{"title": in.Title, "customer_id": customerID,
 			"currency": in.Currency, "owner_id": owner, "lines": len(lines)}); err != nil {
 			return nil, err
 		}
@@ -470,6 +554,9 @@ func (h *Handlers) ActivateContract(c *gin.Context) {
 	}
 	var errs apperrors.FieldErrors
 	signed := httpx.Date(&errs, "signed_on", in.SignedOn)
+	if signed != nil && signed.After(h.today()) {
+		errs.Add("signed_on", "not_future", nil)
+	}
 	if signed == nil && len(errs) == 0 {
 		errs.Add("signed_on", "required", nil)
 	}
@@ -512,4 +599,46 @@ func trimmed(s *string) *string {
 		return nil
 	}
 	return &t
+}
+
+// DraftContractInput supplies editable fields without reconstructing them from progress reports.
+func (h *Handlers) DraftContractInput(c *gin.Context) {
+	id, err := httpx.PathID(c, "id")
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	p := auth.Principal(c)
+	ctx := c.Request.Context()
+	var in contractInput
+	var owner uuid.UUID
+	var version int64
+	err = h.Pool.QueryRow(ctx, `SELECT customer_id,title,customer_reference,delivery_location,currency,owner_id,version FROM contracts WHERE id=$1 AND status='draft' AND ($2::uuid IS NULL OR owner_id=$2)`, id, p.OwnerFilter()).Scan(&in.CustomerID, &in.Title, &in.CustomerReference, &in.DeliveryLocation, &in.Currency, &owner, &version)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	ownerText := owner.String()
+	in.OwnerID = &ownerText
+	in.Version = &version
+	rows, err := h.Pool.Query(ctx, `SELECT product_id::text,name_on_contract,unit,quantity::text,unit_price::text,tax_rate::text,to_char(due_on,'YYYY-MM-DD') FROM contract_lines WHERE contract_id=$1 ORDER BY line_no`, id)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	defer rows.Close()
+	in.Lines = []contractLineInput{}
+	for rows.Next() {
+		var l contractLineInput
+		if err := rows.Scan(&l.ProductID, &l.NameOnContract, &l.Unit, &l.Quantity, &l.UnitPrice, &l.TaxRate, &l.DueOn); err != nil {
+			response.Fail(c, err)
+			return
+		}
+		in.Lines = append(in.Lines, l)
+	}
+	if err := rows.Err(); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, in)
 }

@@ -10,6 +10,7 @@ package misa
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -186,17 +187,18 @@ func (h *Handlers) Preview(c *gin.Context) {
 
 // Export is one file sent to MISA.
 type Export struct {
-	ID        uuid.UUID      `json:"id"`
-	Period    string         `json:"period"`
-	Batch     int            `json:"batch"`
-	FileName  string         `json:"file_name"`
-	Counts    map[string]int `json:"counts"`
-	CreatedBy string         `json:"created_by"`
-	CreatedAt time.Time      `json:"created_at"`
+	ID               uuid.UUID      `json:"id"`
+	Period           string         `json:"period"`
+	Batch            int            `json:"batch"`
+	FileName         string         `json:"file_name"`
+	Counts           map[string]int `json:"counts"`
+	CreatedBy        string         `json:"created_by"`
+	CreatedAt        time.Time      `json:"created_at"`
+	CorrectionNeeded bool           `json:"correction_needed"`
 }
 
 func (h *Handlers) history(ctx context.Context) ([]Export, error) {
-	rows, err := h.Pool.Query(ctx, `SELECT e.id, e.period, e.batch, e.file_name, e.counts, u.full_name, e.created_at FROM misa_exports e
+	rows, err := h.Pool.Query(ctx, `SELECT e.id, e.period, e.batch, e.file_name, e.counts, u.full_name, e.created_at, e.correction_needed FROM misa_exports e
 		JOIN users u ON u.id = e.created_by ORDER BY e.created_at DESC LIMIT 20`)
 	if err != nil {
 		return nil, err
@@ -206,7 +208,7 @@ func (h *Handlers) history(ctx context.Context) ([]Export, error) {
 	for rows.Next() {
 		var e Export
 		var counts []byte
-		if err := rows.Scan(&e.ID, &e.Period, &e.Batch, &e.FileName, &counts, &e.CreatedBy, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.Period, &e.Batch, &e.FileName, &counts, &e.CreatedBy, &e.CreatedAt, &e.CorrectionNeeded); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(counts, &e.Counts)
@@ -238,6 +240,12 @@ func (h *Handlers) CreateExport(c *gin.Context) {
 	if len(in.Types) == 0 {
 		in.Types = docTypes
 	}
+	for _, typ := range in.Types {
+		if typ != "sales" && typ != "purchase" && typ != "cash" {
+			response.Fail(c, apperrors.Invalid("types", "one_of", nil))
+			return
+		}
+	}
 	httpx.Command(c, h.Pool, "misa.export", true, httpx.Created, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('misa_export'))`); err != nil {
@@ -264,11 +272,16 @@ func (h *Handlers) CreateExport(c *gin.Context) {
 		for _, d := range ready {
 			counts[d.Type]++
 		}
+		content, err := workbook(ready)
+		if err != nil {
+			return nil, err
+		}
+		sum := sha256.Sum256(content)
 		e := Export{ID: uuid.New(), Period: from.Format("2006-01"), Batch: batch, Counts: counts, CreatedBy: p.Name, CreatedAt: time.Now()}
 		e.FileName = fmt.Sprintf("NAVO_MISA_%s_lo%d.xlsx", e.Period, batch)
 		cj, _ := json.Marshal(counts)
-		if _, err := tx.Exec(ctx, `INSERT INTO misa_exports (id, period, batch, file_name, counts, created_by) VALUES ($1, $2, $3, $4, $5, $6)`,
-			e.ID, e.Period, batch, e.FileName, cj, p.UserID); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO misa_exports (id, period, batch, file_name, counts, created_by, file_content, file_sha256, mapping_version) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			e.ID, e.Period, batch, e.FileName, cj, p.UserID, content, fmt.Sprintf("%x", sum), "sme2023-draft-v1"); err != nil {
 			return nil, err
 		}
 		tables := map[string]string{"sales": "sales_invoices", "purchase": "purchase_invoices", "receipt": "receipts", "payment": "payments"}
@@ -281,8 +294,7 @@ func (h *Handlers) CreateExport(c *gin.Context) {
 	})
 }
 
-// File handles GET /misa/exports/:id/file: the batch's Excel file, rebuilt from the
-// documents marked with it (the same content every time).
+// File downloads the exact bytes frozen when the batch was prepared.
 func (h *Handlers) File(c *gin.Context) {
 	ctx := c.Request.Context()
 	id, err := httpx.PathID(c, "id")
@@ -291,20 +303,22 @@ func (h *Handlers) File(c *gin.Context) {
 		return
 	}
 	var name string
-	if err := h.Pool.QueryRow(ctx, `SELECT file_name FROM misa_exports WHERE id = $1`, id).Scan(&name); err != nil {
+	var b []byte
+	var checksum *string
+	if err := h.Pool.QueryRow(ctx, `SELECT file_name, file_content, file_sha256 FROM misa_exports WHERE id = $1`, id).Scan(&name, &b, &checksum); err != nil {
 		response.Fail(c, err)
 		return
 	}
-	docs, err := pending(ctx, h.Pool, time.Time{}, time.Time{}, docTypes, &id)
-	if err != nil {
-		response.Fail(c, err)
+	if b == nil || checksum == nil {
+		response.Fail(c, apperrors.Rule("legacy_export_unavailable", "This older batch has no frozen file. Use the originally downloaded workbook; it cannot safely be reconstructed.", nil))
 		return
 	}
-	b, err := workbook(docs)
-	if err != nil {
-		response.Fail(c, err)
+	sum := sha256.Sum256(b)
+	if fmt.Sprintf("%x", sum) != *checksum {
+		response.Fail(c, fmt.Errorf("export checksum mismatch"))
 		return
 	}
+	c.Header("ETag", `"`+*checksum+`"`)
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, name))
 	c.Header("Cache-Control", "private, no-store")
 	c.Data(200, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", b)
@@ -312,6 +326,16 @@ func (h *Handlers) File(c *gin.Context) {
 
 // workbook lays the documents out one sheet per MISA voucher type.
 func workbook(docs []doc) ([]byte, error) {
+	// Excel numeric cells have at most 15 significant decimal digits. Reject
+	// amounts outside that envelope instead of silently rounding customer money.
+	for _, d := range docs {
+		for _, raw := range []string{d.Net, d.VAT, d.Total} {
+			v := decimalx.MustParse(raw)
+			if v.Abs().GreaterThan(decimalx.MustParse("9999999999999.99")) {
+				return nil, apperrors.Rule("export_amount_precision", "An amount is too large for an exact Excel currency export.", map[string]any{"number": d.Number})
+			}
+		}
+	}
 	f := excelize.NewFile()
 	defer f.Close()
 	sheets := []struct {
@@ -563,11 +587,16 @@ func (h *Handlers) Import(c *gin.Context) {
 				continue
 			}
 			table := map[bool]string{true: "products", false: "organizations"}[kind == "product"]
-			if _, err := tx.Exec(ctx, `UPDATE `+table+` SET misa_code = $2 WHERE id = $1 AND misa_code IS NULL
-				AND NOT EXISTS (SELECT 1 FROM `+table+` WHERE misa_code = $2)`, hits[0].id, code); err != nil {
+			tag, err := tx.Exec(ctx, `UPDATE `+table+` SET misa_code = $2 WHERE id = $1 AND misa_code IS NULL
+				AND NOT EXISTS (SELECT 1 FROM `+table+` WHERE misa_code = $2)`, hits[0].id, code)
+			if err != nil {
 				return err
 			}
-			matched++
+			if tag.RowsAffected() == 1 {
+				matched++
+			} else {
+				unmatched = append(unmatched, name)
+			}
 		}
 		return audit.Record(ctx, tx, "import", "misa_catalogue", uuid.Nil, map[string]any{"kind": kind, "matched": matched, "unmatched": len(unmatched)})
 	})
