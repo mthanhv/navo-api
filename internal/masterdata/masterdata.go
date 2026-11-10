@@ -11,8 +11,11 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"navo-api/internal/access"
 	"navo-api/internal/apperrors"
 	"navo-api/internal/audit"
+	"navo-api/internal/auth"
+	"navo-api/internal/crm"
 	"navo-api/internal/httpx"
 	"navo-api/internal/response"
 )
@@ -38,6 +41,11 @@ type Organization struct {
 	PrimaryContact *string `json:"primary_contact"`
 	PrimaryPhone   *string `json:"primary_phone"`
 	PrimaryEmail   *string `json:"primary_email"`
+	// OwnerID is the salesperson who looks after a customer; CanManageContacts says
+	// whether the caller may change or email this partner's contacts.
+	OwnerID           *uuid.UUID `json:"owner_id"`
+	OwnerName         *string    `json:"owner_name"`
+	CanManageContacts bool       `json:"can_manage_contacts"`
 }
 
 type organizationInput struct {
@@ -46,6 +54,41 @@ type organizationInput struct {
 	IsCustomer bool    `json:"is_customer"`
 	IsSupplier bool    `json:"is_supplier"`
 	TaxCode    *string `json:"tax_code"`
+	// OwnerID: absent keeps the owner; "" clears it. Only people who see the whole
+	// company may set it; a salesperson creating a customer becomes its owner.
+	OwnerID *string `json:"owner_id"`
+}
+
+// resolveOwner returns the owner to store (keep=true: leave as is).
+func resolveOwner(ctx context.Context, tx pgx.Tx, p *access.Principal, in organizationInput, creating bool) (owner *uuid.UUID, keep bool, err error) {
+	if p.OwnerFilter() != nil { // a salesperson
+		if in.OwnerID != nil {
+			return nil, false, apperrors.Forbidden("owner_change")
+		}
+		if creating && in.IsCustomer {
+			id := p.UserID
+			return &id, false, nil
+		}
+		return nil, !creating, nil
+	}
+	if in.OwnerID == nil {
+		return nil, !creating, nil
+	}
+	if *in.OwnerID == "" {
+		return nil, false, nil
+	}
+	id, perr := uuid.Parse(*in.OwnerID)
+	var ok bool
+	if perr == nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM users u JOIN user_roles r ON r.user_id = u.id
+			WHERE u.id = $1 AND u.is_active AND r.role IN ('sales', 'admin'))`, id).Scan(&ok); err != nil {
+			return nil, false, err
+		}
+	}
+	if !ok {
+		return nil, false, apperrors.Invalid("owner_id", "not_found", nil)
+	}
+	return &id, false, nil
 }
 
 func (in *organizationInput) validate() error {
@@ -74,6 +117,7 @@ func (in *organizationInput) validate() error {
 
 // CreateOrganization handles POST /organizations.
 func (h *Handlers) CreateOrganization(c *gin.Context) {
+	p := auth.Principal(c)
 	var in organizationInput
 	if err := httpx.Decode(c, &in); err != nil {
 		response.Fail(c, err)
@@ -85,18 +129,47 @@ func (h *Handlers) CreateOrganization(c *gin.Context) {
 	}
 	httpx.Command(c, h.Pool, "organizations.create", false, httpx.Created, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
-		o := Organization{Code: in.Code, Name: in.Name, IsCustomer: in.IsCustomer, IsSupplier: in.IsSupplier, TaxCode: in.TaxCode}
-		err := tx.QueryRow(ctx, `INSERT INTO organizations (code, name, is_customer, is_supplier, tax_code)
-			VALUES ($1, $2, $3, $4, $5) RETURNING id`, o.Code, o.Name, o.IsCustomer, o.IsSupplier, o.TaxCode).Scan(&o.ID)
+		owner, _, err := resolveOwner(ctx, tx, p, in, true)
+		if err != nil {
+			return nil, err
+		}
+		var id uuid.UUID
+		err = tx.QueryRow(ctx, `INSERT INTO organizations (code, name, is_customer, is_supplier, tax_code, owner_id)
+			VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`, in.Code, in.Name, in.IsCustomer, in.IsSupplier, in.TaxCode, owner).Scan(&id)
 		if err != nil {
 			if appErr := apperrors.From(err); appErr.Reason == "duplicate" {
 				return nil, apperrors.Invalid("code", "taken", nil)
 			}
 			return nil, err
 		}
-		return o, audit.Record(ctx, tx, "create", "organization", o.ID, map[string]any{"code": o.Code, "name": o.Name,
-			"is_customer": o.IsCustomer, "is_supplier": o.IsSupplier})
+		o, err := loadOrganization(ctx, tx, p, id)
+		if err != nil {
+			return nil, err
+		}
+		return o, audit.Record(ctx, tx, "create", "organization", id, map[string]any{"code": o.Code, "name": o.Name,
+			"is_customer": o.IsCustomer, "is_supplier": o.IsSupplier, "owner_id": owner})
 	})
+}
+
+// orgSelect reads a partner with its contact summary and owner; placeholder n is the
+// caller's owner filter (for can_manage_contacts).
+func orgSelect(n int) string {
+	return `SELECT o.id, o.code, o.name, o.is_customer, o.is_supplier, o.tax_code,
+	(SELECT count(*) FROM contacts ct WHERE ct.organization_id = o.id), pc.full_name, pc.phone, pc.email, o.owner_id, ou.full_name, ` + crm.Manageable(n)
+}
+
+const orgFrom = `FROM organizations o LEFT JOIN contacts pc ON pc.organization_id = o.id AND pc.is_primary LEFT JOIN users ou ON ou.id = o.owner_id`
+
+func (o *Organization) dest() []any {
+	return []any{&o.ID, &o.Code, &o.Name, &o.IsCustomer, &o.IsSupplier, &o.TaxCode, &o.Contacts, &o.PrimaryContact, &o.PrimaryPhone, &o.PrimaryEmail,
+		&o.OwnerID, &o.OwnerName, &o.CanManageContacts}
+}
+
+// loadOrganization reads one partner as the caller sees it.
+func loadOrganization(ctx context.Context, q pgx.Tx, p *access.Principal, id uuid.UUID) (*Organization, error) {
+	var o Organization
+	err := q.QueryRow(ctx, orgSelect(2)+` `+orgFrom+` WHERE o.id = $1`, id, p.OwnerFilter()).Scan(o.dest()...)
+	return &o, err
 }
 
 // ListOrganizations handles GET /organizations?role=customer|supplier&q= (q also matches
@@ -107,13 +180,11 @@ func (h *Handlers) ListOrganizations(c *gin.Context) {
 	q := strings.TrimSpace(c.Query("q"))
 	items := []Organization{}
 	total := 0
-	rows, err := h.Pool.Query(c.Request.Context(), `SELECT o.id, o.code, o.name, o.is_customer, o.is_supplier, o.tax_code,
-			(SELECT count(*) FROM contacts ct WHERE ct.organization_id = o.id), pc.full_name, pc.phone, pc.email, count(*) OVER ()
-		FROM organizations o LEFT JOIN contacts pc ON pc.organization_id = o.id AND pc.is_primary
+	rows, err := h.Pool.Query(c.Request.Context(), orgSelect(5)+`, count(*) OVER () `+orgFrom+`
 		WHERE ($1 = '' OR ($1 = 'customer' AND o.is_customer) OR ($1 = 'supplier' AND o.is_supplier))
 		  AND ($2 = '' OR o.code ILIKE '%' || $2 || '%' OR o.name ILIKE '%' || $2 || '%'
 		       OR EXISTS (SELECT 1 FROM contacts ct WHERE ct.organization_id = o.id AND (ct.full_name ILIKE '%' || $2 || '%' OR ct.email ILIKE '%' || $2 || '%' OR ct.phone ILIKE '%' || $2 || '%')))
-		ORDER BY o.name, o.id LIMIT $3 OFFSET $4`, role, q, size, (page-1)*size)
+		ORDER BY o.name, o.id LIMIT $3 OFFSET $4`, role, q, size, (page-1)*size, auth.Principal(c).OwnerFilter())
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -121,7 +192,7 @@ func (h *Handlers) ListOrganizations(c *gin.Context) {
 	defer rows.Close()
 	for rows.Next() {
 		var o Organization
-		if err := rows.Scan(&o.ID, &o.Code, &o.Name, &o.IsCustomer, &o.IsSupplier, &o.TaxCode, &o.Contacts, &o.PrimaryContact, &o.PrimaryPhone, &o.PrimaryEmail, &total); err != nil {
+		if err := rows.Scan(append(o.dest(), &total)...); err != nil {
 			response.Fail(c, err)
 			return
 		}
@@ -314,12 +385,22 @@ func (h *Handlers) UpdateOrganization(c *gin.Context) {
 		response.Fail(c, err)
 		return
 	}
+	p := auth.Principal(c)
 	httpx.Command(c, h.Pool, "organizations.update", false, 200, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
-		var before Organization
-		if err := tx.QueryRow(ctx, `SELECT id, code, name, is_customer, is_supplier, tax_code FROM organizations WHERE id = $1 FOR UPDATE`, id).
-			Scan(&before.ID, &before.Code, &before.Name, &before.IsCustomer, &before.IsSupplier, &before.TaxCode); err != nil {
+		if _, err := tx.Exec(ctx, `SELECT id FROM organizations WHERE id = $1 FOR UPDATE`, id); err != nil {
 			return nil, err
+		}
+		before, err := loadOrganization(ctx, tx, p, id)
+		if err != nil {
+			return nil, err
+		}
+		owner, keepOwner, err := resolveOwner(ctx, tx, p, in, false)
+		if err != nil {
+			return nil, err
+		}
+		if keepOwner {
+			owner = before.OwnerID
 		}
 		var usedAsCustomer, usedAsSupplier bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM contracts WHERE customer_id = $1), EXISTS (SELECT 1 FROM purchase_orders WHERE supplier_id = $1)`, id).
@@ -336,12 +417,15 @@ func (h *Handlers) UpdateOrganization(c *gin.Context) {
 		if err := errs.Err(); err != nil {
 			return nil, err
 		}
-		o := Organization{ID: id, Code: in.Code, Name: in.Name, IsCustomer: in.IsCustomer, IsSupplier: in.IsSupplier, TaxCode: in.TaxCode}
-		if _, err := tx.Exec(ctx, `UPDATE organizations SET code = $2, name = $3, is_customer = $4, is_supplier = $5, tax_code = $6,
-				version = version + 1, updated_at = now() WHERE id = $1`, id, o.Code, o.Name, o.IsCustomer, o.IsSupplier, o.TaxCode); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE organizations SET code = $2, name = $3, is_customer = $4, is_supplier = $5, tax_code = $6, owner_id = $7,
+				version = version + 1, updated_at = now() WHERE id = $1`, id, in.Code, in.Name, in.IsCustomer, in.IsSupplier, in.TaxCode, owner); err != nil {
 			if appErr := apperrors.From(err); appErr.Reason == "duplicate" {
 				return nil, apperrors.Invalid("code", "taken", nil)
 			}
+			return nil, err
+		}
+		o, err := loadOrganization(ctx, tx, p, id)
+		if err != nil {
 			return nil, err
 		}
 		return o, audit.Record(ctx, tx, "update", "organization", id, map[string]any{"before": before, "after": o})

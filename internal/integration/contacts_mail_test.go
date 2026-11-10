@@ -57,8 +57,8 @@ func TestContactsAndProductEmails(t *testing.T) {
 	if r := e.do(khoa, "POST", "/api/v1/organizations/"+cust+"/contacts", map[string]any{"full_name": "X", "email": "not an email"}, nil); r.Status != 400 {
 		t.Fatalf("bad address: %d", r.Status)
 	}
-	if r := e.do(lan, "POST", "/api/v1/organizations/"+cust+"/contacts", map[string]any{"full_name": "X"}, nil); r.Status != 403 {
-		t.Fatalf("leaders read contacts but do not edit them: %d", r.Status)
+	if r := e.do(ha, "POST", "/api/v1/organizations/"+cust+"/contacts", map[string]any{"full_name": "X"}, nil); r.Status != 403 || r.reason() != "not_customer_owner" {
+		t.Fatalf("another salesperson reads this customer's contacts but does not edit them: %d %v", r.Status, r.Body)
 	}
 	list := e.do(lan, "GET", "/api/v1/organizations/"+cust+"/contacts", nil, nil).Body["data"].([]any)
 	if len(list) != 4 || list[0].(map[string]any)["full_name"] != "Lê Lan" {
@@ -99,8 +99,8 @@ func TestContactsAndProductEmails(t *testing.T) {
 	if r := e.do(khoa, "POST", "/api/v1/mailings", mail, nil); r.Status != 400 {
 		t.Fatalf("sending needs an Idempotency-Key: %d", r.Status)
 	}
-	if r := e.do(lan, "POST", "/api/v1/mailings", mail, key("m0")); r.Status != 403 {
-		t.Fatalf("leaders do not send: %d", r.Status)
+	if r := e.do(ha, "POST", "/api/v1/mailings", mail, key("m0")); r.Status != 400 {
+		t.Fatalf("another salesperson cannot email this customer's people: %d %v", r.Status, r.Body)
 	}
 	sent := e.must(201, e.do(khoa, "POST", "/api/v1/mailings", mail, key("m1")), "send")
 	if r := e.do(khoa, "POST", "/api/v1/mailings", mail, key("m1")); r.Status != 201 || r.Header.Get("Idempotent-Replayed") != "true" {

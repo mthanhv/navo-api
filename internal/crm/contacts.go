@@ -2,6 +2,7 @@ package crm
 
 import (
 	"context"
+	"fmt"
 	"net/mail"
 	"strings"
 
@@ -9,8 +10,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"navo-api/internal/access"
 	"navo-api/internal/apperrors"
 	"navo-api/internal/audit"
+	"navo-api/internal/auth"
 	"navo-api/internal/db"
 	"navo-api/internal/httpx"
 	"navo-api/internal/response"
@@ -133,11 +136,11 @@ func (h *Handlers) ListContacts(c *gin.Context) {
 	response.OK(c, list)
 }
 
-// ListEmailContacts handles GET /contacts/emailable: customer contacts that have an
-// address and have not asked to stop receiving product news — who a mailing may go to.
+// ListEmailContacts handles GET /contacts/emailable: contacts of customers the caller looks
+// after that have an address and have not asked to stop product news — who a mailing may go to.
 func (h *Handlers) ListEmailContacts(c *gin.Context) {
-	rows, err := h.Pool.Query(c.Request.Context(), contactSelect+` WHERE o.is_customer AND ct.email IS NOT NULL AND ct.accepts_email
-		ORDER BY o.name, ct.is_primary DESC, ct.full_name, ct.id LIMIT 2000`)
+	rows, err := h.Pool.Query(c.Request.Context(), contactSelect+` WHERE o.is_customer AND ct.email IS NOT NULL AND ct.accepts_email AND `+Manageable(1)+`
+		ORDER BY o.name, ct.is_primary DESC, ct.full_name, ct.id LIMIT 2000`, auth.Principal(c).OwnerFilter())
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -148,6 +151,29 @@ func (h *Handlers) ListEmailContacts(c *gin.Context) {
 		return
 	}
 	response.OK(c, list)
+}
+
+// manageableSQL is true for a partner (alias o) whose contacts the caller may change or
+// email; the placeholder is the caller's owner filter (NULL = sees the whole company).
+// Suppliers are shared. A customer belongs to its owner, the owners of its open contracts,
+// and anyone who sees the whole company; an unassigned customer is open to all
+// (owner decision 2026-11-11: shared read, owner writes).
+const manageableSQL = `(NOT o.is_customer OR $%[1]d::uuid IS NULL OR o.owner_id IS NULL OR o.owner_id = $%[1]d
+	OR EXISTS (SELECT 1 FROM contracts mc WHERE mc.customer_id = o.id AND mc.owner_id = $%[1]d AND mc.status IN ('draft', 'active')))`
+
+// Manageable returns manageableSQL bound to placeholder n.
+func Manageable(n int) string { return fmt.Sprintf(manageableSQL, n) }
+
+// mayManage locks the partner and refuses a customer the caller does not look after.
+func mayManage(ctx context.Context, tx pgx.Tx, p *access.Principal, org uuid.UUID) error {
+	var ok bool
+	if err := tx.QueryRow(ctx, `SELECT `+Manageable(2)+` FROM organizations o WHERE o.id = $1 FOR UPDATE OF o`, org, p.OwnerFilter()).Scan(&ok); err != nil {
+		return err
+	}
+	if !ok {
+		return apperrors.Forbidden("not_customer_owner")
+	}
+	return nil
 }
 
 func contactWriteErr(err error) error {
@@ -177,8 +203,8 @@ func (h *Handlers) CreateContact(c *gin.Context) {
 	httpx.Command(c, h.Pool, "contacts.create", false, httpx.Created, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
 		var existing int
-		// Lock the partner so two people adding contacts at once agree on who is the main one.
-		if err := tx.QueryRow(ctx, `SELECT id FROM organizations WHERE id = $1 FOR UPDATE`, orgID).Scan(new(uuid.UUID)); err != nil {
+		// Locks the partner, so two people adding contacts at once agree on who is the main one.
+		if err := mayManage(ctx, tx, auth.Principal(c), orgID); err != nil {
 			return nil, err
 		}
 		if err := tx.QueryRow(ctx, `SELECT count(*) FROM contacts WHERE organization_id = $1`, orgID).Scan(&existing); err != nil {
@@ -224,7 +250,14 @@ func (h *Handlers) UpdateContact(c *gin.Context) {
 		ctx := c.Request.Context()
 		var orgID uuid.UUID
 		var wasPrimary, accepted bool
-		if err := tx.QueryRow(ctx, `SELECT organization_id, is_primary, accepts_email FROM contacts WHERE id = $1 FOR UPDATE`, id).Scan(&orgID, &wasPrimary, &accepted); err != nil {
+		// Partner first, then contact: the same lock order as CreateContact.
+		if err := tx.QueryRow(ctx, `SELECT organization_id FROM contacts WHERE id = $1`, id).Scan(&orgID); err != nil {
+			return nil, err
+		}
+		if err := mayManage(ctx, tx, auth.Principal(c), orgID); err != nil {
+			return nil, err
+		}
+		if err := tx.QueryRow(ctx, `SELECT is_primary, accepts_email FROM contacts WHERE id = $1 AND organization_id = $2 FOR UPDATE`, id, orgID).Scan(&wasPrimary, &accepted); err != nil {
 			return nil, err
 		}
 		if in.IsPrimary && !wasPrimary {
@@ -260,7 +293,13 @@ func (h *Handlers) DeleteContact(c *gin.Context) {
 		ctx := c.Request.Context()
 		var orgID uuid.UUID
 		var name string
-		if err := tx.QueryRow(ctx, `DELETE FROM contacts WHERE id = $1 RETURNING organization_id, full_name`, id).Scan(&orgID, &name); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT organization_id FROM contacts WHERE id = $1`, id).Scan(&orgID); err != nil {
+			return nil, err
+		}
+		if err := mayManage(ctx, tx, auth.Principal(c), orgID); err != nil {
+			return nil, err
+		}
+		if err := tx.QueryRow(ctx, `DELETE FROM contacts WHERE id = $1 AND organization_id = $2 RETURNING full_name`, id, orgID).Scan(&name); err != nil {
 			return nil, err
 		}
 		return gin.H{"id": id}, audit.Record(ctx, tx, "delete", "contact", id, map[string]any{"organization_id": orgID, "full_name": name})

@@ -293,6 +293,10 @@ func (h *Handlers) saveContract(c *gin.Context, editing bool) {
 				numbering.DraftNumber(seq), customerID, in.Title, in.CustomerReference, in.Currency, owner, p.UserID, in.DeliveryLocation).Scan(&id); err != nil {
 				return nil, err
 			}
+			// The first contract for an unassigned customer makes its owner the customer's owner.
+			if _, err := tx.Exec(ctx, `UPDATE organizations SET owner_id = $2, version = version + 1 WHERE id = $1 AND owner_id IS NULL`, customerID, owner); err != nil {
+				return nil, err
+			}
 		}
 
 		for i, l := range lines {

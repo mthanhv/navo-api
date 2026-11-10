@@ -127,7 +127,7 @@ func Compose(toName, body string, products []MailingProduct, senderName, senderE
 }
 
 // prepare validates the input and resolves products and recipients.
-func (h *Handlers) prepare(ctx context.Context, q db.Querier, in *mailingInput, needRecipients bool) ([]MailingProduct, []target, error) {
+func (h *Handlers) prepare(ctx context.Context, q db.Querier, owner *uuid.UUID, in *mailingInput, needRecipients bool) ([]MailingProduct, []target, error) {
 	in.Subject, in.Body = strings.TrimSpace(in.Subject), strings.TrimSpace(in.Body)
 	var errs apperrors.FieldErrors
 	switch {
@@ -197,8 +197,8 @@ func (h *Handlers) prepare(ctx context.Context, q db.Querier, in *mailingInput, 
 	if len(contactIDs) > 0 {
 		rows, err := q.Query(ctx, `SELECT ct.id, ct.organization_id, ct.full_name, ct.email
 			FROM contacts ct JOIN organizations o ON o.id = ct.organization_id
-			WHERE ct.id = ANY($1) AND o.is_customer AND ct.email IS NOT NULL AND ct.accepts_email
-			ORDER BY o.name, ct.full_name, ct.id`, contactIDs)
+			WHERE ct.id = ANY($1) AND o.is_customer AND ct.email IS NOT NULL AND ct.accepts_email AND `+Manageable(2)+`
+			ORDER BY o.name, ct.full_name, ct.id`, contactIDs, owner)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -234,7 +234,7 @@ func (h *Handlers) PreviewMailing(c *gin.Context) {
 		response.Fail(c, err)
 		return
 	}
-	products, targets, err := h.prepare(c.Request.Context(), h.Pool, &in, false)
+	products, targets, err := h.prepare(c.Request.Context(), h.Pool, p.OwnerFilter(), &in, false)
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -262,7 +262,7 @@ func (h *Handlers) CreateMailing(c *gin.Context) {
 	var created uuid.UUID
 	httpx.Command(c, h.Pool, "mailings.create", true, httpx.Created, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
-		products, targets, err := h.prepare(ctx, tx, &in, true)
+		products, targets, err := h.prepare(ctx, tx, p.OwnerFilter(), &in, true)
 		if err != nil {
 			return nil, err
 		}

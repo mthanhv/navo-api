@@ -175,15 +175,15 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 
 	// People at customers and suppliers, and product-news emails to customer contacts.
 	a.GET("/organizations/:id/contacts", need(access.ContractsRead), crmH.ListContacts)
-	a.POST("/organizations/:id/contacts", need(access.PartnersWrite), crmH.CreateContact)
-	a.PATCH("/contacts/:id", need(access.PartnersWrite), crmH.UpdateContact)
-	a.DELETE("/contacts/:id", need(access.PartnersWrite), crmH.DeleteContact)
-	a.GET("/contacts/emailable", need(access.PartnersWrite), crmH.ListEmailContacts)
+	a.POST("/organizations/:id/contacts", need(access.ContactsWrite), crmH.CreateContact)
+	a.PATCH("/contacts/:id", need(access.ContactsWrite), crmH.UpdateContact)
+	a.DELETE("/contacts/:id", need(access.ContactsWrite), crmH.DeleteContact)
+	a.GET("/contacts/emailable", need(access.ContactsWrite), crmH.ListEmailContacts)
 	a.GET("/mailings/status", need(access.ContractsRead), crmH.MailStatus)
 	a.GET("/mailings", need(access.ContractsRead), crmH.ListMailings)
 	a.GET("/mailings/:id", need(access.ContractsRead), crmH.GetMailing)
-	a.POST("/mailings/preview", need(access.PartnersWrite), crmH.PreviewMailing)
-	a.POST("/mailings", need(access.PartnersWrite), crmH.CreateMailing)
+	a.POST("/mailings/preview", need(access.ContactsWrite), crmH.PreviewMailing)
+	a.POST("/mailings", need(access.ContactsWrite), crmH.CreateMailing)
 	crmH.CloseInterrupted(context.Background())
 
 	// MISA SME exchange (5.11): accounting only.
