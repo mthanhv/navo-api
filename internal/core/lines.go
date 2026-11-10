@@ -45,7 +45,9 @@ type LineRow struct {
 	Delivered        decimal.Decimal `json:"delivered"`
 	// Accepted is what the customer has accepted (acceptance documents); Delivered and
 	// Received are net of customer and supplier returns.
-	Accepted             decimal.Decimal `json:"accepted"`
+	Accepted decimal.Decimal `json:"accepted"`
+	// UnitPrice is the contract's sales price for the line (visible with the contract, never a purchase price).
+	UnitPrice            decimal.Decimal `json:"unit_price"`
 	Remaining            decimal.Decimal `json:"remaining"`
 	Over                 decimal.Decimal `json:"over"`
 	Available            decimal.Decimal `json:"available"`
@@ -60,7 +62,7 @@ type LineRow struct {
 const lineProgressSQL = `
 WITH lines AS (
     SELECT cl.id, cl.contract_id, coalesce(c.number, c.draft_number) AS contract_number, c.customer_id, o.name AS customer_name,
-           c.owner_id, u.full_name AS owner_name, cl.line_no, cl.name_on_contract, cl.unit, cl.quantity, cl.due_on,
+           c.owner_id, u.full_name AS owner_name, cl.line_no, cl.name_on_contract, cl.unit, cl.quantity, cl.unit_price, cl.due_on,
            cl.last_business_change_at
     FROM contract_lines cl
     JOIN contracts c ON c.id = cl.contract_id
@@ -98,7 +100,7 @@ WITH lines AS (
     ORDER BY dol.contract_line_id, d.planned_on, d.number
 )
 SELECT l.id, l.contract_id, l.contract_number, l.customer_id, l.customer_name, l.owner_id, l.owner_name, l.line_no, l.name_on_contract,
-       l.unit, l.quantity::text, coalesce(o.q, 0)::text, coalesce(r.q, 0)::text, coalesce(d.q, 0)::text, coalesce(d.a, 0)::text, l.due_on,
+       l.unit, l.quantity::text, coalesce(o.q, 0)::text, coalesce(r.q, 0)::text, coalesce(d.q, 0)::text, coalesce(d.a, 0)::text, l.unit_price::text, l.due_on,
        coalesce(lr.late, false), np.number, np.planned_on, np.firmness, np.quantity::text, l.last_business_change_at
 FROM lines l
 LEFT JOIN ordered o ON o.contract_line_id = l.id
@@ -123,13 +125,13 @@ func QueryLines(ctx context.Context, q db.Querier, owner, contractID *uuid.UUID,
 	out := []LineRow{}
 	for rows.Next() {
 		var r LineRow
-		var qty, ordered, received, delivered, accepted string
+		var qty, ordered, received, delivered, accepted, price string
 		var due *time.Time
 		var late bool
 		var planNumber, planFirmness, planQty *string
 		var planOn *time.Time
 		if err := rows.Scan(&r.ContractLineID, &r.ContractID, &r.ContractNumber, &r.CustomerID, &r.CustomerName, &r.OwnerID, &r.OwnerName,
-			&r.LineNo, &r.NameOnContract, &r.Unit, &qty, &ordered, &received, &delivered, &accepted, &due, &late,
+			&r.LineNo, &r.NameOnContract, &r.Unit, &qty, &ordered, &received, &delivered, &accepted, &price, &due, &late,
 			&planNumber, &planOn, &planFirmness, &planQty, &r.LastBusinessChangeAt); err != nil {
 			return nil, err
 		}
@@ -144,7 +146,7 @@ func QueryLines(ctx context.Context, q db.Querier, owner, contractID *uuid.UUID,
 		}
 		r.ContractQuantity, r.Ordered, r.Received, r.Delivered = facts.Contract, facts.Ordered, facts.Received, facts.Delivered
 		r.Remaining, r.Over, r.Available = progress.Remaining(facts), progress.Over(facts), progress.Available(facts)
-		r.Accepted = decimalx.MustParse(accepted)
+		r.Accepted, r.UnitPrice = decimalx.MustParse(accepted), decimalx.MustParse(price)
 		r.DueOn = dateString(due)
 		r.Flags = progress.Flags(facts, today, horizon)
 		out = append(out, r)
