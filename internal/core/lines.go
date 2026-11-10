@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"time"
 
@@ -31,6 +32,7 @@ type LineRow struct {
 	ContractLineID       uuid.UUID       `json:"contract_line_id"`
 	ContractID           uuid.UUID       `json:"contract_id"`
 	ContractNumber       string          `json:"contract_number"`
+	CustomerID           uuid.UUID       `json:"customer_id"`
 	CustomerName         string          `json:"customer_name"`
 	OwnerID              uuid.UUID       `json:"owner_id"`
 	OwnerName            string          `json:"owner_name"`
@@ -54,7 +56,7 @@ type LineRow struct {
 // line, so joining POs, receipts and deliveries cannot multiply rows (TECHNICAL_DESIGN 3.3).
 const lineProgressSQL = `
 WITH lines AS (
-    SELECT cl.id, cl.contract_id, coalesce(c.number, c.draft_number) AS contract_number, o.name AS customer_name,
+    SELECT cl.id, cl.contract_id, coalesce(c.number, c.draft_number) AS contract_number, c.customer_id, o.name AS customer_name,
            c.owner_id, u.full_name AS owner_name, cl.line_no, cl.name_on_contract, cl.unit, cl.quantity, cl.due_on,
            cl.last_business_change_at
     FROM contract_lines cl
@@ -97,7 +99,7 @@ WITH lines AS (
     WHERE d.status = 'draft' AND d.planned_on IS NOT NULL AND dol.contract_line_id IN (SELECT id FROM lines)
     ORDER BY dol.contract_line_id, d.planned_on, d.number
 )
-SELECT l.id, l.contract_id, l.contract_number, l.customer_name, l.owner_id, l.owner_name, l.line_no, l.name_on_contract,
+SELECT l.id, l.contract_id, l.contract_number, l.customer_id, l.customer_name, l.owner_id, l.owner_name, l.line_no, l.name_on_contract,
        l.unit, l.quantity::text, coalesce(o.q, 0)::text, coalesce(r.q, 0)::text, coalesce(d.q, 0)::text, l.due_on,
        coalesce(lr.late, false), np.number, np.planned_on, np.firmness, np.quantity::text, l.last_business_change_at
 FROM lines l
@@ -128,7 +130,7 @@ func QueryLines(ctx context.Context, q db.Querier, owner, contractID *uuid.UUID,
 		var late bool
 		var planNumber, planFirmness, planQty *string
 		var planOn *time.Time
-		if err := rows.Scan(&r.ContractLineID, &r.ContractID, &r.ContractNumber, &r.CustomerName, &r.OwnerID, &r.OwnerName,
+		if err := rows.Scan(&r.ContractLineID, &r.ContractID, &r.ContractNumber, &r.CustomerID, &r.CustomerName, &r.OwnerID, &r.OwnerName,
 			&r.LineNo, &r.NameOnContract, &r.Unit, &qty, &ordered, &received, &delivered, &due, &late,
 			&planNumber, &planOn, &planFirmness, &planQty, &r.LastBusinessChangeAt); err != nil {
 			return nil, err
@@ -151,39 +153,79 @@ func QueryLines(ctx context.Context, q db.Querier, owner, contractID *uuid.UUID,
 	return out, rows.Err()
 }
 
-// ReportContractLines handles GET /reports/contract-lines?flag=&contract_id=&page=.
-// The flag filter runs after the shared flag rules; the row set is bounded to
-// active contracts in the caller's scope.
+// ReportContractLines handles GET /reports/contract-lines?tab=action|soon|all&flag=&contract_id=&customer_id=&owner_id=&page=.
+// Lines of active contracts in the caller's scope, after the shared flag rules.
+// "action" = a critical or warning flag; "soon" = a delivery planned in the next 7
+// days. Counts for each tab come with the page.
 func (h *Handlers) ReportContractLines(c *gin.Context) {
 	p := auth.Principal(c)
-	var contractID *uuid.UUID
-	if raw := c.Query("contract_id"); raw != "" {
-		id, err := uuid.Parse(raw)
-		if err != nil {
-			response.Fail(c, apperrors.Invalid("contract_id", "uuid", nil))
-			return
-		}
-		contractID = &id
+	var errs apperrors.FieldErrors
+	contractID := optionalUUID(&errs, "contract_id", c.Query("contract_id"))
+	customer := optionalUUID(&errs, "customer_id", c.Query("customer_id"))
+	ownerParam := optionalUUID(&errs, "owner_id", c.Query("owner_id"))
+	if err := errs.Err(); err != nil {
+		response.Fail(c, err)
+		return
 	}
-	rows, err := QueryLines(c.Request.Context(), h.Pool, p.OwnerFilter(), contractID, h.today())
+	owner := p.OwnerFilter()
+	if owner == nil {
+		owner = ownerParam
+	}
+	rows, err := QueryLines(c.Request.Context(), h.Pool, owner, contractID, h.today())
 	if err != nil {
 		response.Fail(c, err)
 		return
 	}
-	if flag := strings.TrimSpace(c.Query("flag")); flag != "" {
-		filtered := rows[:0]
-		for _, r := range rows {
-			for _, f := range r.Flags {
-				if f.Code == flag || (flag == "needs_action" && (f.Severity == progress.Critical || f.Severity == progress.Warning)) {
-					filtered = append(filtered, r)
-					break
-				}
-			}
+	tab := c.Query("tab")
+	flag := strings.TrimSpace(c.Query("flag"))
+	if flag == "needs_action" {
+		tab, flag = "action", ""
+	}
+	soonUntil := h.today().AddDate(0, 0, 7).Format(time.DateOnly)
+	counts := map[string]int{"action": 0, "soon": 0, "all": 0}
+	filtered := []LineRow{}
+	for _, r := range rows {
+		if customer != nil && r.CustomerID != *customer {
+			continue
 		}
-		rows = filtered
+		action := NeedsAction(r)
+		soon := r.NextDelivery != nil && r.NextDelivery.PlannedOn <= soonUntil
+		counts["all"]++
+		if action {
+			counts["action"]++
+		}
+		if soon {
+			counts["soon"]++
+		}
+		if (tab == "action" && !action) || (tab == "soon" && !soon) || (flag != "" && !hasFlag(r, flag)) {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	if tab == "action" {
+		sort.SliceStable(filtered, func(i, j int) bool { return severityRank(filtered[i]) < severityRank(filtered[j]) })
 	}
 	page, size := httpx.Page(c)
-	start := min((page-1)*size, len(rows))
-	end := min(start+size, len(rows))
-	response.List(c, rows[start:end], page, size, len(rows))
+	start := min((page-1)*size, len(filtered))
+	end := min(start+size, len(filtered))
+	response.ListCounts(c, filtered[start:end], page, size, len(filtered), counts)
+}
+
+// NeedsAction reports whether a line has a critical or warning flag.
+func NeedsAction(r LineRow) bool {
+	for _, f := range r.Flags {
+		if f.Severity == progress.Critical || f.Severity == progress.Warning {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFlag(r LineRow, code string) bool {
+	for _, f := range r.Flags {
+		if f.Code == code {
+			return true
+		}
+	}
+	return false
 }

@@ -1,5 +1,6 @@
 // Package access defines roles, permissions and data scope (TECHNICAL_DESIGN 5.2).
-// Admin and leader are separate; admin never gets business or finance data by default.
+// Admin holds every permission and sees the whole company (owner decision, 2026-11-10;
+// before that admin was kept away from business and finance data).
 package access
 
 import "github.com/google/uuid"
@@ -39,6 +40,8 @@ const (
 	// Sensitive grants: never implied by a role title, granted one by one.
 	PurchaseCostRead Permission = "purchase_cost.read"
 	FinanceRead      Permission = "finance.read"
+	// FinanceWrite records invoices, receipts, payments and MISA exports (accounting).
+	FinanceWrite     Permission = "finance.write"
 	QuantityOverride Permission = "quantity.override"
 )
 
@@ -48,9 +51,13 @@ var Grantable = map[Permission]bool{PurchaseCostRead: true, FinanceRead: true, Q
 var roleDefaults = map[Role][]Permission{
 	Sales:      {ContractsRead, ContractsWrite, ProcurementWrite, FulfillmentWrite, FulfillmentConfirm, PartnersWrite, CatalogWrite, ReportsOperations},
 	Leader:     {ContractsRead, ReportsOperations},
-	Accounting: {ContractsRead, PurchaseCostRead, FinanceRead},
-	Admin:      {UsersManage, QuantityOverride},
+	Accounting: {ContractsRead, PurchaseCostRead, FinanceRead, FinanceWrite},
+	Admin:      all,
 }
+
+// all is every permission; the admin role holds it.
+var all = []Permission{ContractsRead, ContractsWrite, ProcurementWrite, FulfillmentWrite, FulfillmentConfirm, PartnersWrite, CatalogWrite,
+	ReportsOperations, UsersManage, PurchaseCostRead, FinanceRead, FinanceWrite, QuantityOverride}
 
 // Principal is the signed-in user with resolved permissions.
 type Principal struct {
@@ -70,8 +77,8 @@ func NewPrincipal(id uuid.UUID, name, email string, roles []Role, grants []strin
 		for _, perm := range roleDefaults[r] {
 			p.perms[perm] = true
 		}
-		// Leaders and accounting read the whole company; sales read their own (REQUIREMENTS 2).
-		if r == Leader || r == Accounting {
+		// Leaders, accounting and admin read the whole company; sales read their own (REQUIREMENTS 2).
+		if r == Leader || r == Accounting || r == Admin {
 			p.seesAll = true
 		}
 	}

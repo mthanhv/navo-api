@@ -33,6 +33,7 @@ type env struct {
 	t    *testing.T
 	srv  *httptest.Server
 	pool *pgxpool.Pool
+	mail *outbox
 }
 
 type result struct {
@@ -67,9 +68,10 @@ func setup(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	loc, _ := time.LoadLocation("Asia/Ho_Chi_Minh")
-	srv := httptest.NewServer(router.New(config.Config{SessionTTL: time.Hour, Timezone: loc}, pool))
+	outbox := &outbox{}
+	srv := httptest.NewServer(router.NewWithMailer(config.Config{SessionTTL: time.Hour, Timezone: loc, FilesDir: t.TempDir()}, pool, outbox))
 	t.Cleanup(func() { srv.Close(); pool.Close() })
-	return &env{t: t, srv: srv, pool: pool}
+	return &env{t: t, srv: srv, pool: pool, mail: outbox}
 }
 
 func (e *env) user(email string, roles []string, grants ...string) {
@@ -324,8 +326,8 @@ func TestContractToDeliveryFlow(t *testing.T) {
 	if r := e.do(leader, "POST", "/api/v1/contracts", map[string]any{}, nil); r.Status != 403 {
 		t.Fatalf("leader must not create contracts by default: %d", r.Status)
 	}
-	if r := e.do(admin, "GET", "/api/v1/contracts", nil, nil); r.Status != 403 {
-		t.Fatalf("admin must not read business data by default: %d", r.Status)
+	if r := e.do(admin, "GET", "/api/v1/contracts", nil, nil); r.Status != 200 || r.data()["pagination"].(map[string]any)["total"].(float64) == 0 {
+		t.Fatalf("admin holds every permission and sees the whole company: %d %v", r.Status, r.Body)
 	}
 	salesPO := e.must(200, e.do(sales, "GET", "/api/v1/purchase-orders/"+po1["id"].(string), nil, nil), "sales PO")
 	if _, ok := salesPO["lines"].([]any)[0].(map[string]any)["unit_price"]; ok {
@@ -372,5 +374,121 @@ func TestCookieWritesNeedClientHeader(t *testing.T) {
 	e.must(201, e.do("", "POST", "/api/v1/organizations", body, map[string]string{"Cookie": cookie, "X-Navo-Client": "web"}), "cookie write with header")
 	if r := e.do("", "POST", "/api/v1/auth/login", map[string]any{"email": "khoa@test.vn", "password": "wrong-password"}, nil); r.reason() != "invalid_credentials" {
 		t.Fatalf("wrong password: %v", r.Body)
+	}
+}
+
+func TestOverrideApprovalAndLists(t *testing.T) {
+	e := setup(t)
+	e.user("khoa@test.vn", []string{"sales"})
+	e.user("ha@test.vn", []string{"sales"})
+	e.user("nam@test.vn", []string{"admin"})
+	sales, other, admin := e.login("khoa@test.vn"), e.login("ha@test.vn"), e.login("nam@test.vn")
+
+	customer := e.must(201, e.do(sales, "POST", "/api/v1/organizations", map[string]any{"code": "STRA", "name": "Sông Trà", "is_customer": true}, nil), "customer")
+	supplier := e.must(201, e.do(sales, "POST", "/api/v1/organizations", map[string]any{"code": "DGA", "name": "Đông Á", "is_supplier": true}, nil), "supplier")
+	product := e.must(201, e.do(sales, "POST", "/api/v1/products", map[string]any{"name": "Van", "unit": "bộ"}, nil), "product")
+	contract := e.must(201, e.do(sales, "POST", "/api/v1/contracts", map[string]any{"customer_id": customer["id"], "title": "X", "currency": "VND",
+		"lines": []any{map[string]any{"product_id": product["id"], "quantity": "10", "unit_price": "1"}}}, nil), "contract")
+	cid := contract["id"].(string)
+	contract = e.must(200, e.do(sales, "POST", "/api/v1/contracts/"+cid+"/activate", map[string]any{"signed_on": "2026-08-01"}, key("act")), "activate")
+	line := lineByNo(contract, 1)["contract_line_id"]
+
+	po := e.must(201, e.do(sales, "POST", "/api/v1/contracts/"+cid+"/purchase-orders", map[string]any{"supplier_id": supplier["id"], "currency": "USD",
+		"lines": []any{map[string]any{"contract_line_id": line, "quantity": "12", "unit_price": "5"}}}, nil), "po")
+	poID := po["id"].(string)
+	if r := e.do(sales, "POST", "/api/v1/purchase-orders/"+poID+"/confirm", nil, key("c1")); r.reason() != "quantity_exceeds_contract" {
+		t.Fatalf("over-order must be refused first: %v", r.Body)
+	}
+	if r := e.do(other, "POST", "/api/v1/purchase-orders/"+poID+"/override-request", map[string]any{"reason": "x"}, nil); r.Status != 404 {
+		t.Fatalf("another salesperson cannot request on this PO: %d", r.Status)
+	}
+	if r := e.do(sales, "POST", "/api/v1/purchase-orders/"+poID+"/override-request", map[string]any{"reason": " "}, nil); r.Status != 400 {
+		t.Fatalf("a reason is required: %d", r.Status)
+	}
+	e.must(201, e.do(sales, "POST", "/api/v1/purchase-orders/"+poID+"/override-request", map[string]any{"reason": "Khách xin thêm 2 bộ dự phòng"}, nil), "request")
+	if r := e.do(sales, "POST", "/api/v1/purchase-orders/"+poID+"/override-request", map[string]any{"reason": "again"}, nil); r.reason() != "override_already_pending" {
+		t.Fatalf("one open request per document: %v", r.Body)
+	}
+	if r := e.do(sales, "GET", "/api/v1/override-requests", nil, nil); r.Status != 403 {
+		t.Fatalf("sales cannot see the approval queue: %d", r.Status)
+	}
+	if pending := e.must(200, e.do(sales, "GET", "/api/v1/purchase-orders/"+poID, nil, nil), "po")["override"].(map[string]any); pending["status"] != "pending" {
+		t.Fatalf("the requester sees the pending request: %v", pending)
+	}
+
+	queue := e.must(200, e.do(admin, "GET", "/api/v1/override-requests", nil, nil), "queue")
+	items := queue["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("queue: %v", queue)
+	}
+	req := items[0].(map[string]any)
+	l0 := req["lines"].([]any)[0].(map[string]any)
+	if l0["over"] != "2" || l0["requested"] != "12" {
+		t.Fatalf("admin sees the excess: %v", l0)
+	}
+	if _, leaked := l0["unit_price"]; leaked {
+		t.Fatal("admin must not see purchase prices")
+	}
+	rid := req["id"].(string)
+	if r := e.do(admin, "POST", "/api/v1/override-requests/"+rid+"/reject", map[string]any{}, key("rej")); r.Status != 400 {
+		t.Fatalf("rejecting needs a note: %d", r.Status)
+	}
+	approved := e.must(200, e.do(admin, "POST", "/api/v1/override-requests/"+rid+"/approve", map[string]any{"note": "OK, có phụ lục sau"}, key("app")), "approve")
+	if approved["status"] != "approved" || approved["decided_by"] != "nam@test.vn" {
+		t.Fatalf("approval: %v", approved)
+	}
+	if r := e.do(admin, "POST", "/api/v1/override-requests/"+rid+"/approve", map[string]any{}, key("app2")); r.reason() != "override_already_decided" {
+		t.Fatalf("decided once: %v", r.Body)
+	}
+	if st := e.must(200, e.do(sales, "GET", "/api/v1/purchase-orders/"+poID, nil, nil), "po")["status"]; st != "confirmed" {
+		t.Fatalf("approval confirms the PO: %v", st)
+	}
+	l := lineByNo(e.must(200, e.do(sales, "GET", "/api/v1/contracts/"+cid, nil, nil), "contract"), 1)
+	if l["ordered"] != "12" || !strings.Contains(strings.Join(flagCodes(l), ","), "over_ordered") {
+		t.Fatalf("line after approved over-order: ordered=%v flags=%v", l["ordered"], flagCodes(l))
+	}
+
+	// Lists across contracts.
+	awaiting := e.must(200, e.do(sales, "GET", "/api/v1/purchase-orders?view=awaiting", nil, nil), "po list")
+	if awaiting["pagination"].(map[string]any)["total"].(float64) != 1 {
+		t.Fatalf("awaiting goods: %v", awaiting)
+	}
+	if e.must(200, e.do(other, "GET", "/api/v1/purchase-orders?view=all", nil, nil), "other list")["pagination"].(map[string]any)["total"].(float64) != 0 {
+		t.Fatal("another salesperson's PO list must be empty")
+	}
+
+	// Over-delivery with approval; stock is still required.
+	poLine := e.must(200, e.do(sales, "GET", "/api/v1/purchase-orders/"+poID, nil, nil), "po")["lines"].([]any)[0].(map[string]any)["id"]
+	gr := e.must(201, e.do(sales, "POST", "/api/v1/purchase-orders/"+poID+"/goods-receipts", map[string]any{"received_on": "2026-09-01",
+		"lines": []any{map[string]any{"purchase_order_line_id": poLine, "accepted_quantity": "12"}}}, nil), "gr")
+	e.must(200, e.do(sales, "POST", "/api/v1/goods-receipts/"+gr["id"].(string)+"/confirm", nil, key("gr")), "confirm gr")
+	newDO := func(q string) string {
+		return e.must(201, e.do(sales, "POST", "/api/v1/contracts/"+cid+"/delivery-orders", map[string]any{"lines": []any{map[string]any{"contract_line_id": line, "quantity": q}}}, nil), "do")["id"].(string)
+	}
+	do1 := newDO("11")
+	if r := e.do(sales, "POST", "/api/v1/delivery-orders/"+do1+"/confirm", map[string]any{"delivered_on": "2026-09-05"}, key("d1")); r.reason() != "delivery_exceeds_contract" {
+		t.Fatalf("over-delivery refused first: %v", r.Body)
+	}
+	if r := e.do(sales, "POST", "/api/v1/delivery-orders/"+do1+"/override-request", map[string]any{"reason": "Hao hụt khi cắt"}, nil); r.Status != 400 {
+		t.Fatalf("a delivery request needs the delivery date: %d", r.Status)
+	}
+	e.must(201, e.do(sales, "POST", "/api/v1/delivery-orders/"+do1+"/override-request", map[string]any{"reason": "Hao hụt khi cắt", "delivered_on": "2026-09-05"}, nil), "do request")
+	q := e.must(200, e.do(admin, "GET", "/api/v1/override-requests", nil, nil), "queue")["items"].([]any)[0].(map[string]any)
+	e.must(200, e.do(admin, "POST", "/api/v1/override-requests/"+q["id"].(string)+"/approve", map[string]any{}, key("d-app")), "approve do")
+	do2 := newDO("5")
+	e.must(201, e.do(sales, "POST", "/api/v1/delivery-orders/"+do2+"/override-request", map[string]any{"reason": "thêm", "delivered_on": "2026-09-06"}, nil), "do2 request")
+	q2 := e.must(200, e.do(admin, "GET", "/api/v1/override-requests", nil, nil), "queue")["items"].([]any)[0].(map[string]any)
+	if r := e.do(admin, "POST", "/api/v1/override-requests/"+q2["id"].(string)+"/approve", map[string]any{}, key("d-app2")); r.reason() != "insufficient_stock" {
+		t.Fatalf("approval never delivers goods that were not received: %v", r.Body)
+	}
+	if left := e.must(200, e.do(admin, "GET", "/api/v1/override-requests", nil, nil), "queue")["items"].([]any); len(left) != 1 {
+		t.Fatalf("a failed approval keeps the request pending: %d", len(left))
+	}
+	delivered := e.must(200, e.do(sales, "GET", "/api/v1/delivery-orders?view=delivered", nil, nil), "do list")
+	if delivered["pagination"].(map[string]any)["total"].(float64) != 1 {
+		t.Fatalf("delivered list: %v", delivered)
+	}
+	if l := lineByNo(e.must(200, e.do(sales, "GET", "/api/v1/contracts/"+cid, nil, nil), "contract"), 1); l["delivered"] != "11" || flagCodes(l)[0] != "over_delivered" {
+		t.Fatalf("over-delivered line: %v %v", l["delivered"], flagCodes(l))
 	}
 }

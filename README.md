@@ -43,6 +43,19 @@ result (`Idempotent-Replayed: true`).
 | POST | `/api/v1/purchase-orders/:id/goods-receipts`; POST `/goods-receipts/:id/confirm` | fulfillment.write / .confirm |
 | POST | `/api/v1/contracts/:id/delivery-orders`; POST `/delivery-orders/:id/confirm` | fulfillment.write / .confirm |
 | GET | `/api/v1/reports/contract-lines` (`?flag=no_plan\|needs_action…&contract_id=`) | contracts.read |
+| GET | `/api/v1/purchase-orders` (`?view=awaiting\|draft\|all`), `/delivery-orders` (`?view=planned\|delivered`) | contracts.read |
+| POST | `/api/v1/purchase-orders/:id/override-request` `{reason}`; `/delivery-orders/:id/override-request` `{reason, delivered_on}` | procurement / fulfillment.write |
+| GET, POST | `/api/v1/override-requests` (`?status=pending\|decided`); `/:id/approve` `{note?}`; `/:id/reject` `{note}` | quantity.override (Admin) |
+| GET | `/api/v1/reports/overview`, `/contracts/:id/documents` | contracts.read |
+| GET, POST | `/api/v1/organizations/:id/contacts`; PATCH, DELETE `/contacts/:id` (many contacts per customer/supplier, one main) | contracts.read / partners.write |
+| GET | `/api/v1/contacts/emailable` (customer contacts with an address who accept product news) | partners.write |
+| GET | `/api/v1/mailings`, `/mailings/:id`, `/mailings/status` | contracts.read (sales: own) |
+| POST | `/api/v1/mailings/preview`; `/mailings` `{subject, body, product_ids, contact_ids}` (Idempotency-Key; one copy per contact, sent in the background) | partners.write |
+
+Admin holds every permission and sees the whole company. Products also carry `description`,
+`origin`, `supplier_id` (optional usual supplier) and `supplier_item_code`. Email needs
+`NAVO_SMTP_HOST` and `NAVO_MAIL_FROM` (see `.env.example`); without them sending answers
+`email_disabled` and everything else works.
 
 ### Error responses
 
@@ -53,7 +66,7 @@ result (`Idempotent-Replayed: true`).
 Rule reasons so far: `contract_not_draft`, `contract_not_active`, `document_not_draft`,
 `quantity_exceeds_contract`, `receipt_exceeds_ordered`, `delivery_exceeds_contract`,
 `insufficient_stock`, `purchase_order_not_confirmed`, `invalid_credentials`,
-`idempotency_payload_mismatch`, `idempotency_in_progress`, `csrf_header_missing`.
+`idempotency_payload_mismatch`, `idempotency_in_progress`, `csrf_header_missing`, `override_already_pending`, `override_already_decided`, `email_disabled`.
 Field codes: `required`, `too_long`, `format`, `decimal`, `greater_than`, `less_or_equal`, `date`,
 `uuid`, `currency`, `one_of`, `duplicate`, `taken`, `not_found`, `not_in_contract`,
 `not_customer`, `not_supplier`, `email`, `length`, `tax_code`, `type`, `invalid_json`.
@@ -66,6 +79,6 @@ Field codes: `required`, `too_long`, `format`, `decimal`, `greater_than`, `less_
 
 ## Not yet built (next increments)
 
-Admin approval of over-quantities (BR-05 currently refuses), returns and reversals, acceptance,
+Returns and reversals, acceptance,
 amendments, finance (invoices, receipts/payments, allocations), files and documents tree,
 CRM notes/tasks, MISA export, AI drafts, OpenAPI file and backup runbook.

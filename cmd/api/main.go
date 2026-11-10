@@ -18,6 +18,10 @@ import (
 )
 
 func main() {
+	// `navo-api healthcheck` lets the container check itself: the image has no shell or curl.
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		os.Exit(healthcheck())
+	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	if err := run(); err != nil {
 		slog.Error("api stopped", "error", err)
@@ -62,4 +66,24 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
+}
+
+func healthcheck() int {
+	addr := os.Getenv("NAVO_ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
+	if addr[0] == ':' {
+		addr = "127.0.0.1" + addr
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	res, err := client.Get("http://" + addr + "/readyz")
+	if err != nil {
+		return 1
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return 1
+	}
+	return 0
 }

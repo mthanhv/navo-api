@@ -59,6 +59,18 @@ func List(c *gin.Context, items any, page, pageSize, total int) {
 	OK(c, Page{Items: items, Pagination: Pagination{Page: page, PageSize: pageSize, Total: total, TotalPages: totalPages}})
 }
 
+// ListCounts answers a page plus per-tab counts for list screens with tabs.
+func ListCounts(c *gin.Context, items any, page, pageSize, total int, counts map[string]int) {
+	totalPages := (total + pageSize - 1) / pageSize
+	if totalPages == 0 {
+		totalPages = 1
+	}
+	OK(c, struct {
+		Page
+		Counts map[string]int `json:"counts"`
+	}{Page{Items: items, Pagination: Pagination{Page: page, PageSize: pageSize, Total: total, TotalPages: totalPages}}, counts})
+}
+
 // Fail answers an error. Server faults are logged with their cause and
 // returned without internal detail; the request id lets support find the log.
 func Fail(c *gin.Context, err error) {

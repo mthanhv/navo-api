@@ -176,7 +176,7 @@ func main() {
 	}
 	// Sông Trà: the AC-01 contract from the mockups.
 	k := khoa.call("POST", "/api/v1/contracts", map[string]any{"customer_id": id(stra), "title": "Thiết bị đo và van · bảo dưỡng tổng thể 2027",
-		"currency": "VND", "customer_reference": "PR-5520/2026", "lines": []any{
+		"currency": "VND", "customer_reference": "PR-5520/2026", "delivery_location": "Phân xưởng bảo dưỡng", "lines": []any{
 			l(valve50, "24", "18500000", "2026-10-15"),
 			l(tempTx, "40", "9800000", "2026-11-30"),
 			l(pressTx, "100", "24000000", "2026-12-15", "Bộ chuyển đổi áp suất 0-40bar, 4-20mA, HART"),

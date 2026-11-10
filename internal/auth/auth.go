@@ -22,6 +22,7 @@ import (
 
 	"navo-api/internal/access"
 	"navo-api/internal/apperrors"
+	"navo-api/internal/audit"
 	"navo-api/internal/httpx"
 	"navo-api/internal/reqctx"
 	"navo-api/internal/response"
@@ -281,4 +282,89 @@ func (l *limiter) allow(key string) bool {
 	}
 	w.count++
 	return w.count <= l.max
+}
+
+// ValidatePassword applies the password rule to one field (10–72 bytes; bcrypt's limit).
+func ValidatePassword(field, password string) error {
+	if l := len(password); l < 10 || l > 72 {
+		return apperrors.Invalid(field, "length", map[string]any{"min": 10, "max": 72})
+	}
+	return nil
+}
+
+// SetPassword stores a new password hash for an existing user.
+func SetPassword(ctx context.Context, tx pgx.Tx, userID uuid.UUID, password string) error {
+	hash, err := HashPassword(password)
+	if err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1`, userID, hash)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+// RevokeSessions ends a user's sessions, except the one whose token is keepToken.
+func RevokeSessions(ctx context.Context, tx pgx.Tx, userID uuid.UUID, keepToken string) error {
+	var keep []byte
+	if keepToken != "" {
+		keep = hashToken(keepToken)
+	}
+	_, err := tx.Exec(ctx, `UPDATE sessions SET revoked_at = now()
+		WHERE user_id = $1 AND revoked_at IS NULL AND ($2::bytea IS NULL OR token_hash <> $2)`, userID, keep)
+	return err
+}
+
+type changePasswordInput struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+// ChangePassword handles POST /me/password: the current password is required, and
+// the user's other sessions (other browsers, the phone) end.
+func (s *Service) ChangePassword(c *gin.Context) {
+	p := Principal(c)
+	if !s.limiter.allow("pw:" + p.UserID.String()) {
+		response.Fail(c, apperrors.TooManyRequests())
+		return
+	}
+	var in changePasswordInput
+	if err := httpx.Decode(c, &in); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	var errs apperrors.FieldErrors
+	if in.CurrentPassword == "" {
+		errs.Add("current_password", "required", nil)
+	}
+	if l := len(in.NewPassword); l < 10 || l > 72 {
+		errs.Add("new_password", "length", map[string]any{"min": 10, "max": 72})
+	} else if in.NewPassword == in.CurrentPassword {
+		errs.Add("new_password", "same_as_current", nil)
+	}
+	if err := errs.Err(); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	httpx.Command(c, s.Pool, "me.password", false, 200, func(tx pgx.Tx) (any, error) {
+		ctx := c.Request.Context()
+		var hash string
+		if err := tx.QueryRow(ctx, `SELECT password_hash FROM users WHERE id = $1 FOR UPDATE`, p.UserID).Scan(&hash); err != nil {
+			return nil, err
+		}
+		if bcrypt.CompareHashAndPassword([]byte(hash), []byte(in.CurrentPassword)) != nil {
+			return nil, apperrors.Invalid("current_password", "incorrect", nil)
+		}
+		if err := SetPassword(ctx, tx, p.UserID, in.NewPassword); err != nil {
+			return nil, err
+		}
+		if err := RevokeSessions(ctx, tx, p.UserID, tokenFrom(c)); err != nil {
+			return nil, err
+		}
+		return gin.H{"password_changed": true}, audit.Record(ctx, tx, "change_password", "user", p.UserID, nil)
+	})
 }
