@@ -68,6 +68,60 @@ type Overview struct {
 	// lines still to be ordered from suppliers; most severe first, at most 200.
 	Attention []LineRow  `json:"attention"`
 	Upcoming  []Upcoming `json:"upcoming"`
+	// LineStatus splits every line of the active contracts by its most severe flag (chart).
+	LineStatus LineStatus `json:"line_status"`
+	// Weekly counts deliveries made (past six weeks) and planned (this week and five ahead).
+	Weekly []WeekDeliveries `json:"weekly"`
+}
+
+// LineStatus is how many contract lines are in each state; the four add up to all lines.
+type LineStatus struct {
+	Delivered int `json:"delivered"`
+	OnTrack   int `json:"on_track"`
+	Warning   int `json:"warning"`
+	Critical  int `json:"critical"`
+}
+
+// WeekDeliveries is one Monday-to-Sunday week of delivery orders.
+type WeekDeliveries struct {
+	WeekStart string `json:"week_start"`
+	Delivered int    `json:"delivered"`
+	Planned   int    `json:"planned"`
+}
+
+// weekly counts confirmed deliveries by the day delivered and open ones by the day planned.
+func weekly(ctx context.Context, h *Handlers, owner *uuid.UUID, today time.Time) ([]WeekDeliveries, error) {
+	monday := today.AddDate(0, 0, -((int(today.Weekday()) + 6) % 7))
+	first := monday.AddDate(0, 0, -6*7)
+	out := make([]WeekDeliveries, 12)
+	for i := range out {
+		out[i].WeekStart = first.AddDate(0, 0, 7*i).Format(time.DateOnly)
+	}
+	rows, err := h.Pool.Query(ctx, `SELECT (coalesce(d.delivered_on, d.planned_on) - $2::date) / 7, d.status = 'confirmed', count(*)
+		FROM delivery_orders d JOIN contracts c ON c.id = d.contract_id
+		WHERE d.status IN ('draft', 'confirmed') AND ($1::uuid IS NULL OR c.owner_id = $1)
+		  AND coalesce(d.delivered_on, d.planned_on) >= $2::date AND coalesce(d.delivered_on, d.planned_on) < $2::date + 84
+		GROUP BY 1, 2`, owner, first)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var week, n int
+		var done bool
+		if err := rows.Scan(&week, &done, &n); err != nil {
+			return nil, err
+		}
+		if week < 0 || week >= len(out) {
+			continue
+		}
+		if done {
+			out[week].Delivered += n
+		} else {
+			out[week].Planned += n
+		}
+	}
+	return out, rows.Err()
 }
 
 // ReportOverview handles GET /reports/overview.
@@ -86,6 +140,16 @@ func (h *Handlers) ReportOverview(c *gin.Context) {
 	for _, r := range rows {
 		if r.Remaining.IsPositive() {
 			o.LinesRemaining++
+		}
+		switch rank := severityRank(r); {
+		case !r.Remaining.IsPositive():
+			o.LineStatus.Delivered++
+		case rank == 0:
+			o.LineStatus.Critical++
+		case rank == 1:
+			o.LineStatus.Warning++
+		default:
+			o.LineStatus.OnTrack++
 		}
 		for _, f := range r.Flags {
 			o.FlagCounts[f.Code]++
@@ -115,6 +179,10 @@ func (h *Handlers) ReportOverview(c *gin.Context) {
 	}
 	o.Upcoming, err = upcoming(ctx, h, owner, today)
 	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	if o.Weekly, err = weekly(ctx, h, owner, today); err != nil {
 		response.Fail(c, err)
 		return
 	}

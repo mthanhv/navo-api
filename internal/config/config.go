@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"navo-api/internal/mailer"
 )
 
 // Config holds runtime settings.
@@ -21,6 +23,8 @@ type Config struct {
 	// AnthropicAPIKey enables AI drafts (O-17); empty keeps the feature off.
 	AnthropicAPIKey string
 	AIModel         string
+	// SMTP enables product-news emails to customers; empty host keeps the feature off.
+	SMTP mailer.Config
 }
 
 // Load reads the environment.
@@ -31,6 +35,11 @@ func Load() (Config, error) {
 		FilesDir:        envOr("NAVO_FILES_DIR", "var/files"),
 		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
 		AIModel:         envOr("NAVO_AI_MODEL", "claude-opus-5-5"),
+		SMTP: mailer.Config{Host: os.Getenv("NAVO_SMTP_HOST"), Port: envOr("NAVO_SMTP_PORT", "587"), Username: os.Getenv("NAVO_SMTP_USERNAME"),
+			Password: os.Getenv("NAVO_SMTP_PASSWORD"), From: os.Getenv("NAVO_MAIL_FROM")},
+	}
+	if _, err := mailer.New(cfg.SMTP); err != nil {
+		return cfg, err
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")

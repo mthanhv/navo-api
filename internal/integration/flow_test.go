@@ -33,6 +33,7 @@ type env struct {
 	t    *testing.T
 	srv  *httptest.Server
 	pool *pgxpool.Pool
+	mail *outbox
 }
 
 type result struct {
@@ -67,9 +68,10 @@ func setup(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	loc, _ := time.LoadLocation("Asia/Ho_Chi_Minh")
-	srv := httptest.NewServer(router.New(config.Config{SessionTTL: time.Hour, Timezone: loc, FilesDir: t.TempDir()}, pool))
+	outbox := &outbox{}
+	srv := httptest.NewServer(router.NewWithMailer(config.Config{SessionTTL: time.Hour, Timezone: loc, FilesDir: t.TempDir()}, pool, outbox))
 	t.Cleanup(func() { srv.Close(); pool.Close() })
-	return &env{t: t, srv: srv, pool: pool}
+	return &env{t: t, srv: srv, pool: pool, mail: outbox}
 }
 
 func (e *env) user(email string, roles []string, grants ...string) {
@@ -324,8 +326,8 @@ func TestContractToDeliveryFlow(t *testing.T) {
 	if r := e.do(leader, "POST", "/api/v1/contracts", map[string]any{}, nil); r.Status != 403 {
 		t.Fatalf("leader must not create contracts by default: %d", r.Status)
 	}
-	if r := e.do(admin, "GET", "/api/v1/contracts", nil, nil); r.Status != 403 {
-		t.Fatalf("admin must not read business data by default: %d", r.Status)
+	if r := e.do(admin, "GET", "/api/v1/contracts", nil, nil); r.Status != 200 || r.data()["pagination"].(map[string]any)["total"].(float64) == 0 {
+		t.Fatalf("admin holds every permission and sees the whole company: %d %v", r.Status, r.Body)
 	}
 	salesPO := e.must(200, e.do(sales, "GET", "/api/v1/purchase-orders/"+po1["id"].(string), nil, nil), "sales PO")
 	if _, ok := salesPO["lines"].([]any)[0].(map[string]any)["unit_price"]; ok {

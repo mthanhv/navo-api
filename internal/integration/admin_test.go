@@ -25,10 +25,9 @@ func TestAccountsAndCorrections(t *testing.T) {
 	if r := e.do(admin, "PATCH", "/api/v1/users/"+adminID, map[string]any{"full_name": "Nam", "roles": []string{"sales"}, "is_active": true}, nil); r.reason() != "cannot_lock_out_self" {
 		t.Fatalf("self demotion must be refused: %v", r.Body)
 	}
-	// Admin cannot hand out purchase-cost access they do not hold.
-	if r := e.do(admin, "PATCH", "/api/v1/users/"+salesID, map[string]any{"full_name": "Khoa", "roles": []string{"sales"}, "grants": []string{"purchase_cost.read"}, "is_active": true}, nil); r.Status != 403 {
-		t.Fatalf("grant escalation must be refused: %d %v", r.Status, r.Body)
-	}
+	// Admin holds every permission, so may grant purchase-cost access; then takes it back.
+	e.must(200, e.do(admin, "PATCH", "/api/v1/users/"+salesID, map[string]any{"full_name": "Khoa", "roles": []string{"sales"}, "grants": []string{"purchase_cost.read"}, "is_active": true}, nil), "grant")
+	e.must(200, e.do(admin, "PATCH", "/api/v1/users/"+salesID, map[string]any{"full_name": "Khoa", "roles": []string{"sales"}, "grants": []string{}, "is_active": true}, nil), "ungrant")
 	// Change own password: wrong current is a field error; success keeps this session and ends the others.
 	if r := e.do(sales, "POST", "/api/v1/me/password", map[string]any{"current_password": "nope-nope-nope", "new_password": "new-horse-battery-2"}, nil); r.Status != 400 {
 		t.Fatalf("wrong current password: %d %v", r.Status, r.Body)

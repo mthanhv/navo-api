@@ -1,5 +1,6 @@
 // Package access defines roles, permissions and data scope (TECHNICAL_DESIGN 5.2).
-// Admin and leader are separate; admin never gets business or finance data by default.
+// Admin holds every permission and sees the whole company (owner decision, 2026-11-10;
+// before that admin was kept away from business and finance data).
 package access
 
 import "github.com/google/uuid"
@@ -51,8 +52,12 @@ var roleDefaults = map[Role][]Permission{
 	Sales:      {ContractsRead, ContractsWrite, ProcurementWrite, FulfillmentWrite, FulfillmentConfirm, PartnersWrite, CatalogWrite, ReportsOperations},
 	Leader:     {ContractsRead, ReportsOperations},
 	Accounting: {ContractsRead, PurchaseCostRead, FinanceRead, FinanceWrite},
-	Admin:      {UsersManage, QuantityOverride},
+	Admin:      all,
 }
+
+// all is every permission; the admin role holds it.
+var all = []Permission{ContractsRead, ContractsWrite, ProcurementWrite, FulfillmentWrite, FulfillmentConfirm, PartnersWrite, CatalogWrite,
+	ReportsOperations, UsersManage, PurchaseCostRead, FinanceRead, FinanceWrite, QuantityOverride}
 
 // Principal is the signed-in user with resolved permissions.
 type Principal struct {
@@ -72,8 +77,8 @@ func NewPrincipal(id uuid.UUID, name, email string, roles []Role, grants []strin
 		for _, perm := range roleDefaults[r] {
 			p.perms[perm] = true
 		}
-		// Leaders and accounting read the whole company; sales read their own (REQUIREMENTS 2).
-		if r == Leader || r == Accounting {
+		// Leaders, accounting and admin read the whole company; sales read their own (REQUIREMENTS 2).
+		if r == Leader || r == Accounting || r == Admin {
 			p.seesAll = true
 		}
 	}

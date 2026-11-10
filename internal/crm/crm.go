@@ -1,5 +1,6 @@
 // Package crm keeps what sales learn in the field: notes about a customer (written on
-// the phone, often offline) and the follow-up tasks they create (REQUIREMENTS 5.10).
+// the phone, often offline) and the follow-up tasks they create (REQUIREMENTS 5.10),
+// the people at each customer and supplier, and product-news emails to customer contacts.
 package crm
 
 import (
@@ -18,11 +19,16 @@ import (
 	"navo-api/internal/auth"
 	"navo-api/internal/db"
 	"navo-api/internal/httpx"
+	"navo-api/internal/mailer"
 	"navo-api/internal/response"
 )
 
-// Handlers serve notes and tasks.
-type Handlers struct{ Pool *pgxpool.Pool }
+// Handlers serve notes, tasks, partner contacts and product-news emails.
+type Handlers struct {
+	Pool *pgxpool.Pool
+	// Mail sends product-news emails; nil or disabled keeps sending off.
+	Mail mailer.Sender
+}
 
 // Task is something to do, usually by the person who wrote the note.
 type Task struct {

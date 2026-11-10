@@ -3,6 +3,7 @@ package router
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"navo-api/internal/documents"
 	"navo-api/internal/files"
 	"navo-api/internal/finance"
+	"navo-api/internal/mailer"
 	"navo-api/internal/masterdata"
 	"navo-api/internal/middleware"
 	"navo-api/internal/misa"
@@ -25,8 +27,17 @@ import (
 	"navo-api/internal/users"
 )
 
-// New builds the HTTP handler.
+// New builds the HTTP handler, sending email through the configured SMTP account.
 func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
+	smtp, err := mailer.New(cfg.SMTP)
+	if err != nil { // config.Load already refused this; a hand-built Config just runs with email off
+		slog.Warn("email is off", "error", err)
+	}
+	return NewWithMailer(cfg, pool, smtp)
+}
+
+// NewWithMailer is New with the email sender given (tests pass a recorder).
+func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) http.Handler {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	// Only the edge proxy (Caddy on the private Docker network, or localhost) may set
@@ -139,13 +150,26 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	a.POST("/ai/note-parse", need(access.ContractsRead), aiH.NoteParse)
 
 	// Field notes and follow-up tasks (5.10).
-	crmH := &crm.Handlers{Pool: pool}
+	crmH := &crm.Handlers{Pool: pool, Mail: mail}
 	a.POST("/notes", need(access.ContractsRead), crmH.CreateNote)
 	a.GET("/notes", need(access.ContractsRead), crmH.ListNotes)
 	a.GET("/tasks", crmH.MyTasks)
 	a.POST("/tasks", crmH.CreateTask)
 	a.POST("/tasks/:id/done", crmH.SetTaskDone(true))
 	a.POST("/tasks/:id/reopen", crmH.SetTaskDone(false))
+
+	// People at customers and suppliers, and product-news emails to customer contacts.
+	a.GET("/organizations/:id/contacts", need(access.ContractsRead), crmH.ListContacts)
+	a.POST("/organizations/:id/contacts", need(access.PartnersWrite), crmH.CreateContact)
+	a.PATCH("/contacts/:id", need(access.PartnersWrite), crmH.UpdateContact)
+	a.DELETE("/contacts/:id", need(access.PartnersWrite), crmH.DeleteContact)
+	a.GET("/contacts/emailable", need(access.PartnersWrite), crmH.ListEmailContacts)
+	a.GET("/mailings/status", need(access.ContractsRead), crmH.MailStatus)
+	a.GET("/mailings", need(access.ContractsRead), crmH.ListMailings)
+	a.GET("/mailings/:id", need(access.ContractsRead), crmH.GetMailing)
+	a.POST("/mailings/preview", need(access.PartnersWrite), crmH.PreviewMailing)
+	a.POST("/mailings", need(access.PartnersWrite), crmH.CreateMailing)
+	crmH.CloseInterrupted(context.Background())
 
 	// MISA SME exchange (5.11): accounting only.
 	ms := &misa.Handlers{Pool: pool}
