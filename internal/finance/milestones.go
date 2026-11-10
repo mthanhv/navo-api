@@ -78,9 +78,7 @@ type Milestone struct {
 const milestoneSQL = `
 SELECT m.id, m.contract_id, c.number, c.customer_id, cu.name, m.seq, m.version, m.name, m.percent::text, m.amount::text, c.currency, m.trigger,
        m.days_after, m.fixed_due_on, m.triggered_on, m.trigger_note, c.signed_on,
-       NOT EXISTS (SELECT 1 FROM contract_lines cl WHERE cl.contract_id = c.id AND cl.quantity > coalesce((
-           SELECT sum(dol.quantity) FROM delivery_order_lines dol JOIN delivery_orders d ON d.id = dol.delivery_order_id
-           WHERE dol.contract_line_id = cl.id AND d.status = 'confirmed'), 0)) AS fully_delivered,
+       NOT EXISTS (SELECT 1 FROM contract_lines cl WHERE cl.contract_id = c.id AND cl.quantity > line_delivered(cl.id)) AS fully_delivered,
        (SELECT d.number || ' ' || d.delivered_on::text FROM delivery_orders d WHERE d.contract_id = c.id AND d.status = 'confirmed'
         ORDER BY d.delivered_on DESC, d.number DESC LIMIT 1) AS last_delivery,
        coalesce((SELECT sum(a.amount) FROM receipt_allocations a WHERE a.milestone_id = m.id AND a.reversed_at IS NULL), 0)::text
@@ -494,13 +492,9 @@ func (h *Handlers) TriggerMilestone(c *gin.Context) {
 			return nil, apperrors.Rule("milestone_already_triggered", "Correct the existing event before recording a new one.", nil)
 		}
 		if trigger == "acceptance" {
-			var incomplete bool
-			if err := tx.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM delivery_orders WHERE contract_id=$1 AND status='confirmed') OR EXISTS(SELECT 1 FROM contract_lines cl WHERE cl.contract_id=$1 AND cl.quantity>coalesce((SELECT sum(l.quantity) FROM delivery_order_lines l JOIN delivery_orders d ON d.id=l.delivery_order_id WHERE l.contract_line_id=cl.id AND d.status='confirmed' AND d.delivered_on<=$2),0))`, contractID, *on).Scan(&incomplete); err != nil {
-				return nil, err
-			}
-			if incomplete {
-				return nil, apperrors.Rule("acceptance_requires_delivery", "Record full delivery before acceptance; acceptance cannot predate delivery.", nil)
-			}
+			// Acceptance terms fall due from acceptance documents when every line is fully
+			// accepted (owner decision 2026-11-11); there is no second, hand-entered path.
+			return nil, apperrors.Rule("acceptance_from_documents", "Record the customer's acceptance on the contract; this term falls due when every line is fully accepted.", nil)
 		}
 		if err := recordTermHistory(ctx, tx, id, p.UserID); err != nil {
 			return nil, err
@@ -582,7 +576,7 @@ func (h *Handlers) Receivables(c *gin.Context) {
 		JOIN LATERAL (SELECT coalesce(sum(round(cl.quantity * cl.unit_price, 2)), 0) AS value FROM contract_lines cl WHERE cl.contract_id = c.id) v ON true
 		LEFT JOIN LATERAL (SELECT sum(a.amount) AS paid FROM receipt_allocations a JOIN payment_milestones m ON m.id = a.milestone_id
 			WHERE m.contract_id = c.id AND a.reversed_at IS NULL) p ON true
-		WHERE c.status = 'active' GROUP BY c.currency`)
+		WHERE c.status IN ('active', 'closed') GROUP BY c.currency`)
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -677,11 +671,15 @@ func (h *Handlers) ResetMilestone(c *gin.Context) {
 			return nil, err
 		}
 		var event bool
-		if err := tx.QueryRow(ctx, `SELECT triggered_on IS NOT NULL FROM payment_milestones WHERE id=$1 FOR UPDATE`, id).Scan(&event); err != nil {
+		var fromAcceptance bool
+		if err := tx.QueryRow(ctx, `SELECT triggered_on IS NOT NULL, acceptance_id IS NOT NULL FROM payment_milestones WHERE id=$1 FOR UPDATE`, id).Scan(&event, &fromAcceptance); err != nil {
 			return nil, err
 		}
 		if !event {
 			return nil, apperrors.Rule("milestone_not_triggered", "There is no recorded event to correct.", nil)
+		}
+		if fromAcceptance {
+			return nil, apperrors.Rule("acceptance_from_documents", "This date comes from an acceptance document; reverse that document to correct it.", nil)
 		}
 		var dependent bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM receipt_allocations WHERE milestone_id=$1 AND reversed_at IS NULL)`, id).Scan(&dependent); err != nil {

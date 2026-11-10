@@ -380,8 +380,8 @@ func (h *Handlers) ListContracts(c *gin.Context) {
 	customer := optionalUUID(&errs, "customer_id", c.Query("customer_id"))
 	ownerParam := optionalUUID(&errs, "owner_id", c.Query("owner_id"))
 	tab := c.Query("tab")
-	if tab != "" && tab != "action" && tab != "soon" && tab != "all" && tab != "draft" {
-		errs.Add("tab", "one_of", map[string]any{"values": []string{"action", "soon", "all", "draft"}})
+	if tab != "" && tab != "action" && tab != "soon" && tab != "all" && tab != "draft" && tab != "ended" {
+		errs.Add("tab", "one_of", map[string]any{"values": []string{"action", "soon", "all", "draft", "ended"}})
 	}
 	if err := errs.Err(); err != nil {
 		response.Fail(c, err)
@@ -393,7 +393,8 @@ func (h *Handlers) ListContracts(c *gin.Context) {
 	}
 	statuses := []string{"draft", "active", "closed", "cancelled"}
 	if tab != "" {
-		statuses = []string{"draft", "active"}
+		// "ended" = closed or cancelled; the other tabs work on open contracts.
+		statuses = []string{"draft", "active", "closed", "cancelled"}
 	} else if s := c.Query("status"); s != "" {
 		statuses = []string{s}
 	}
@@ -433,7 +434,7 @@ func (h *Handlers) ListContracts(c *gin.Context) {
 			a.soon = true
 		}
 	}
-	counts := map[string]int{"action": 0, "soon": 0, "all": 0, "draft": 0}
+	counts := map[string]int{"action": 0, "soon": 0, "all": 0, "draft": 0, "ended": 0}
 	items := []Contract{}
 	for _, k := range all {
 		if k.Status == "active" {
@@ -458,8 +459,13 @@ func (h *Handlers) ListContracts(c *gin.Context) {
 		}
 		if k.Status == "draft" {
 			counts["draft"]++
+			if tab == "" || tab == "draft" {
+				items = append(items, k)
+			}
+			continue
 		}
-		if tab == "" || tab == "draft" {
+		counts["ended"]++ // closed or cancelled
+		if tab == "" || tab == "ended" {
 			items = append(items, k)
 		}
 	}

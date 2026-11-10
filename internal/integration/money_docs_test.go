@@ -181,7 +181,7 @@ func TestReceivablesAndAllocation(t *testing.T) {
 	if e.must(200, e.do(mai, "GET", "/api/v1/receipts/"+rid, nil, nil), "receipt again")["unallocated"] != "100000000" {
 		t.Fatal("a retried allocation is recorded once")
 	}
-	// Acceptance requires complete delivery and an evidence reference.
+	// Acceptance is a document with quantities and evidence; full acceptance makes the 70% due.
 	sup := e.must(201, e.do(khoa, "POST", "/api/v1/organizations", map[string]any{"code": "FINSUP", "name": "Supplier", "is_supplier": true}, nil), "supplier")
 	po := e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+kid+"/purchase-orders", map[string]any{"supplier_id": sup["id"], "currency": "VND", "lines": []any{map[string]any{"contract_line_id": lineByNo(k, 1)["contract_line_id"], "quantity": "10", "unit_price": "1"}}}, nil), "finance PO")
 	e.must(200, e.do(khoa, "POST", "/api/v1/purchase-orders/"+po["id"].(string)+"/confirm", nil, key("fpo")), "finance PO confirm")
@@ -189,7 +189,8 @@ func TestReceivablesAndAllocation(t *testing.T) {
 	e.must(200, e.do(khoa, "POST", "/api/v1/goods-receipts/"+gr["id"].(string)+"/confirm", nil, key("fgr")), "finance GR confirm")
 	delivery := e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+kid+"/delivery-orders", map[string]any{"lines": []any{map[string]any{"contract_line_id": lineByNo(k, 1)["contract_line_id"], "quantity": "10"}}}, nil), "finance DO")
 	e.must(200, e.do(khoa, "POST", "/api/v1/delivery-orders/"+delivery["id"].(string)+"/confirm", map[string]any{"delivered_on": "2026-10-20"}, key("fdo")), "finance DO confirm")
-	e.must(200, e.do(khoa, "POST", "/api/v1/milestones/"+acc["id"].(string)+"/trigger", map[string]any{"on": "2026-10-20", "note": "Biên bản nghiệm thu 20/10"}, key("t")), "acceptance")
+	e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+kid+"/acceptances", map[string]any{"on": "2026-10-20", "evidence": "Biên bản nghiệm thu 20/10",
+		"lines": []any{map[string]any{"contract_line_id": lineByNo(k, 1)["contract_line_id"], "quantity": "10"}}}, key("t")), "acceptance")
 	got = e.must(200, e.do(mai, "POST", "/api/v1/receipts/"+rid+"/allocations", map[string]any{"allocations": []any{map[string]any{"milestone_id": acc["id"], "amount": "100000000"}}}, key("ok2")), "allocate 2")
 	if got["unallocated"] != "0" {
 		t.Fatalf("all allocated: %v", got)

@@ -160,8 +160,7 @@ func scanOverride(ctx context.Context, q db.Querier, row pgx.Row) (*OverrideRequ
 				          WHERE x.contract_line_id = cl.id AND xp.status = 'confirmed'), 0)::text
 			FROM purchase_order_lines pol JOIN contract_lines cl ON cl.id = pol.contract_line_id WHERE pol.purchase_order_id = $1 ORDER BY cl.line_no`,
 		"delivery_order": `SELECT cl.line_no, cl.name_on_contract, cl.unit, cl.quantity::text, dol.quantity::text,
-				coalesce((SELECT sum(x.quantity) FROM delivery_order_lines x JOIN delivery_orders xd ON xd.id = x.delivery_order_id
-				          WHERE x.contract_line_id = cl.id AND xd.status = 'confirmed'), 0)::text
+				line_delivered(cl.id)::text
 			FROM delivery_order_lines dol JOIN contract_lines cl ON cl.id = dol.contract_line_id WHERE dol.delivery_order_id = $1 ORDER BY cl.line_no`,
 	}[r.Kind]
 	rows, err := q.Query(ctx, lineSQL, r.DocumentID)

@@ -70,8 +70,7 @@ func loadPO(ctx context.Context, q db.Querier, id uuid.UUID, p *access.Principal
 	}
 	rows, err := q.Query(ctx, `SELECT pol.id, pol.contract_line_id, cl.line_no, cl.name_on_contract, pol.supplier_item_name, cl.unit,
 			(pol.quantity-pol.cancelled_quantity)::text, pol.unit_price::text, pol.expected_on, pol.cancelled_quantity::text,
-			coalesce((SELECT sum(grl.accepted_quantity) FROM goods_receipt_lines grl JOIN goods_receipts gr ON gr.id = grl.goods_receipt_id
-			          WHERE grl.purchase_order_line_id = pol.id AND gr.status = 'confirmed'), 0)::text
+			po_line_received(pol.id)::text
 		FROM purchase_order_lines pol JOIN contract_lines cl ON cl.id = pol.contract_line_id
 		WHERE pol.purchase_order_id = $1 ORDER BY cl.line_no, pol.id`, id)
 	if err != nil {

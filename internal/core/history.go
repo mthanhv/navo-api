@@ -44,6 +44,9 @@ UNION ALL SELECT 'receipt_allocation', a.id, rc.number, NULL, NULL FROM receipt_
 	JOIN payment_milestones m ON m.id = a.milestone_id JOIN receipts rc ON rc.id = a.receipt_id WHERE m.contract_id = $1
 UNION ALL SELECT DISTINCT 'receipt', rc.id, rc.number, NULL, NULL FROM receipts rc
 	JOIN receipt_allocations a ON a.receipt_id = rc.id JOIN payment_milestones m ON m.id = a.milestone_id WHERE m.contract_id = $1
+UNION ALL SELECT 'acceptance', id, number, NULL, NULL FROM acceptances WHERE contract_id = $1
+UNION ALL SELECT 'customer_return', id, number, NULL, NULL FROM customer_returns WHERE contract_id = $1
+UNION ALL SELECT 'supplier_return', id, number, NULL, NULL FROM supplier_returns WHERE contract_id = $1
 UNION ALL SELECT DISTINCT 'file', l.file_id, f.original_name, l.owner_type, l.doc_kind FROM attachment_links l
 	JOIN files f ON f.id = l.file_id WHERE l.contract_id = $1`
 

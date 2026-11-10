@@ -214,8 +214,7 @@ func (h *Handlers) ConfirmGoodsReceipt(c *gin.Context) {
 		for _, ch := range checks {
 			lineIDs = append(lineIDs, ch.contractLine)
 			var already string
-			if err := tx.QueryRow(ctx, `SELECT coalesce(sum(grl.accepted_quantity), 0)::text FROM goods_receipt_lines grl
-				JOIN goods_receipts gr ON gr.id = grl.goods_receipt_id WHERE grl.purchase_order_line_id = $1 AND gr.status = 'confirmed'`, ch.poLine).Scan(&already); err != nil {
+			if err := tx.QueryRow(ctx, `SELECT po_line_received($1)::text`, ch.poLine).Scan(&already); err != nil {
 				return nil, err
 			}
 			if decimalx.MustParse(already).Add(ch.accepted).GreaterThan(ch.ordered) {
@@ -452,12 +451,7 @@ func confirmDOTx(ctx context.Context, tx pgx.Tx, id uuid.UUID, deliveredOn time.
 	for i, ch := range checks {
 		lineIDs[i] = ch.lineID
 		var deliveredSoFar, received string
-		if err := tx.QueryRow(ctx, `SELECT
-				coalesce((SELECT sum(dol.quantity) FROM delivery_order_lines dol JOIN delivery_orders d ON d.id = dol.delivery_order_id
-				          WHERE dol.contract_line_id = $1 AND d.status = 'confirmed'), 0)::text,
-				coalesce((SELECT sum(grl.accepted_quantity) FROM goods_receipt_lines grl JOIN goods_receipts gr ON gr.id = grl.goods_receipt_id
-				          JOIN purchase_order_lines pol ON pol.id = grl.purchase_order_line_id
-				          WHERE pol.contract_line_id = $1 AND gr.status = 'confirmed'), 0)::text`, ch.lineID).Scan(&deliveredSoFar, &received); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT line_delivered($1)::text, line_received($1)::text`, ch.lineID).Scan(&deliveredSoFar, &received); err != nil {
 			return err
 		}
 		done, in := decimalx.MustParse(deliveredSoFar), decimalx.MustParse(received)

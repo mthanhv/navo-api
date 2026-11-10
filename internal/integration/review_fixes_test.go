@@ -188,3 +188,177 @@ func TestContractHistory(t *testing.T) {
 		t.Fatalf("another salesperson cannot read this contract's history: %d", r.Status)
 	}
 }
+
+// receiveAndDeliver orders, receives and delivers on the fixture's line.
+func (e *env) receiveAndDeliver(token string, f fixture, tag, ordered, delivered string) (po, poLine string) {
+	e.t.Helper()
+	p := e.must(201, e.do(token, "POST", "/api/v1/contracts/"+f.contract+"/purchase-orders", map[string]any{"supplier_id": f.supplier, "currency": "VND",
+		"lines": []any{map[string]any{"contract_line_id": f.line, "quantity": ordered, "unit_price": "1"}}}, nil), "po")
+	po, poLine = p["id"].(string), p["lines"].([]any)[0].(map[string]any)["id"].(string)
+	e.must(200, e.do(token, "POST", "/api/v1/purchase-orders/"+po+"/confirm", nil, key(tag+"-po")), "po confirm")
+	gr := e.must(201, e.do(token, "POST", "/api/v1/purchase-orders/"+po+"/goods-receipts", map[string]any{"received_on": "2026-10-01",
+		"lines": []any{map[string]any{"purchase_order_line_id": poLine, "accepted_quantity": ordered}}}, nil), "gr")["id"].(string)
+	e.must(200, e.do(token, "POST", "/api/v1/goods-receipts/"+gr+"/confirm", nil, key(tag+"-gr")), "gr confirm")
+	if delivered != "0" {
+		e.deliver(token, f, tag, delivered)
+	}
+	return po, poLine
+}
+
+func (e *env) deliver(token string, f fixture, tag, qty string) string {
+	e.t.Helper()
+	d := e.must(201, e.do(token, "POST", "/api/v1/contracts/"+f.contract+"/delivery-orders", map[string]any{"lines": []any{map[string]any{"contract_line_id": f.line, "quantity": qty}}}, nil), "do")["id"].(string)
+	e.must(200, e.do(token, "POST", "/api/v1/delivery-orders/"+d+"/confirm", map[string]any{"delivered_on": "2026-10-05"}, key(tag+"-do-"+qty)), "do confirm")
+	return d
+}
+
+func (e *env) line(token string, f fixture) map[string]any {
+	e.t.Helper()
+	return lineByNo(e.must(200, e.do(token, "GET", "/api/v1/contracts/"+f.contract, nil, nil), "contract"), 1)
+}
+
+// Acceptance and returns keep net figures right (AC-05, AC-07, AC-10): accepted ≤ delivered;
+// a customer return lowers delivered and puts goods back in stock; a supplier return lowers
+// received; reversing either is refused when the goods have moved on. "After acceptance"
+// money falls due only on full acceptance.
+func TestAcceptanceAndReturns(t *testing.T) {
+	e := setup(t)
+	e.user("khoa@test.vn", []string{"sales"})
+	e.user("mai@test.vn", []string{"accounting"})
+	khoa, mai := e.login("khoa@test.vn"), e.login("mai@test.vn")
+	f := e.activeContract(khoa, "ACC", "10")
+	term := e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/milestones", map[string]any{"name": "Sau nghiệm thu", "amount": "10", "trigger": "acceptance", "days_after": 0}, nil), "term")["id"].(string)
+	po, poLine := e.receiveAndDeliver(khoa, f, "acc", "10", "6")
+	pa := func(qty string) map[string]any {
+		return map[string]any{"on": "2026-10-06", "evidence": "BB nghiệm thu", "reason": "Hàng lỗi", "lines": []any{map[string]any{"contract_line_id": f.line, "quantity": qty}}}
+	}
+	acc1 := e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/acceptances", pa("4"), key("acc1")), "accept 4")
+	if acc1["number"] != "AC-26-0001-01" {
+		t.Fatalf("acceptance number: %v", acc1["number"])
+	}
+	if r := e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/acceptances", pa("3"), key("acc-over")); r.Status != 400 {
+		t.Fatalf("only 2 delivered but not accepted: %d %v", r.Status, r.Body)
+	}
+	if r := e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/acceptances", map[string]any{"on": "2099-01-01", "evidence": "x", "lines": pa("1")["lines"]}, key("acc-future")); r.Status != 400 {
+		t.Fatalf("a future date is refused: %d", r.Status)
+	}
+	if r := e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/customer-returns", pa("3"), key("cr-over")); r.Status != 400 {
+		t.Fatalf("accepted goods cannot be returned without reversing acceptance: %d", r.Status)
+	}
+	cr := e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/customer-returns", pa("2"), key("cr")), "return 2")
+	l := e.line(khoa, f)
+	if l["delivered"] != "4" || l["accepted"] != "4" || l["available"] != "6" || l["remaining"] != "6" {
+		t.Fatalf("delivered 6 − returned 2 = 4; returned goods back in stock: %v", l)
+	}
+	if r := e.do(khoa, "POST", "/api/v1/milestones/"+term+"/trigger", map[string]any{"on": "2026-10-06", "note": "x"}, key("hand")); r.reason() != "acceptance_from_documents" {
+		t.Fatalf("no hand-entered acceptance: %v", r.Body)
+	}
+
+	// Supplier return: at most what is in stock and not delivered (10 received − 4 delivered).
+	sr := func(qty string) map[string]any {
+		return map[string]any{"on": "2026-10-07", "reason": "Lỗi kỹ thuật", "lines": []any{map[string]any{"purchase_order_line_id": poLine, "quantity": qty}}}
+	}
+	if r := e.do(khoa, "POST", "/api/v1/purchase-orders/"+po+"/supplier-returns", sr("7"), key("sr-over")); r.Status != 400 {
+		t.Fatalf("cannot return goods already delivered: %d %v", r.Status, r.Body)
+	}
+	srDoc := e.must(201, e.do(khoa, "POST", "/api/v1/purchase-orders/"+po+"/supplier-returns", sr("5"), key("sr")), "supplier return 5")
+	if l = e.line(khoa, f); l["received"] != "5" || l["available"] != "1" {
+		t.Fatalf("received 10 − 5 returned: %v", l)
+	}
+	if po := e.must(200, e.do(khoa, "GET", "/api/v1/purchase-orders/"+po, nil, nil), "po")["lines"].([]any)[0].(map[string]any); po["received"] != "5" {
+		t.Fatalf("the PO line expects 5 more after the return: %v", po)
+	}
+	reason := map[string]any{"reason": "Nhập nhầm"}
+	if r := e.do(khoa, "POST", "/api/v1/customer-returns/"+cr["id"].(string)+"/reverse", reason, key("cr-rev-early")); r.reason() != "insufficient_stock" {
+		t.Fatalf("the returned goods went back to the supplier, so the customer return stays: %v", r.Body)
+	}
+	e.must(200, e.do(khoa, "POST", "/api/v1/supplier-returns/"+srDoc["id"].(string)+"/reverse", reason, key("sr-rev")), "reverse supplier return")
+	e.must(200, e.do(khoa, "POST", "/api/v1/customer-returns/"+cr["id"].(string)+"/reverse", reason, key("cr-rev")), "reverse customer return")
+	if l = e.line(khoa, f); l["delivered"] != "6" || l["received"] != "10" {
+		t.Fatalf("both reversals restore the figures: %v", l)
+	}
+
+	// Full acceptance makes the term due; partial never does.
+	terms := func() map[string]any {
+		return e.must(200, e.do(mai, "GET", "/api/v1/receivables?tab=all", nil, nil), "receivables")["items"].([]any)[0].(map[string]any)
+	}
+	if terms()["status"] != "wait" {
+		t.Fatalf("4 of 10 accepted: not due: %v", terms())
+	}
+	e.deliver(khoa, f, "acc-rest", "4")
+	acc2 := e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/acceptances", pa("6"), key("acc2")), "accept the rest")
+	if m := terms(); m["status"] == "wait" || m["due_on"] != "2026-10-06" {
+		t.Fatalf("fully accepted: the term falls due: %v", m)
+	}
+	if r := e.do(khoa, "POST", "/api/v1/delivery-orders/"+e.must(200, e.do(khoa, "GET", "/api/v1/contracts/"+f.contract+"/documents", nil, nil), "docs")["delivery_orders"].([]any)[0].(map[string]any)["id"].(string)+"/reverse", reason, key("do-rev")); r.reason() != "reversal_has_dependents" {
+		t.Fatalf("accepted deliveries cannot be reversed: %v", r.Body)
+	}
+	e.must(200, e.do(khoa, "POST", "/api/v1/acceptances/"+acc2["id"].(string)+"/reverse", reason, key("acc2-rev")), "reverse acceptance")
+	if m := terms(); m["status"] != "wait" {
+		t.Fatalf("no longer fully accepted: the term waits again: %v", m)
+	}
+	docs := e.must(200, e.do(khoa, "GET", "/api/v1/contracts/"+f.contract+"/documents", nil, nil), "docs")
+	if len(docs["acceptances"].([]any)) != 2 || len(docs["customer_returns"].([]any)) != 1 || len(docs["supplier_returns"].([]any)) != 1 {
+		t.Fatalf("every document is kept, reversed ones marked: %v", docs)
+	}
+}
+
+// Amendments change an active contract with history (BR-06); close, cancel and reopen
+// carry a reason; a closed contract takes no new orders but can still be accepted.
+func TestAmendCloseCancel(t *testing.T) {
+	e := setup(t)
+	e.user("khoa@test.vn", []string{"sales"})
+	khoa := e.login("khoa@test.vn")
+	f := e.activeContract(khoa, "AMD", "10")
+	e.receiveAndDeliver(khoa, f, "amd", "10", "6")
+	version := e.must(200, e.do(khoa, "GET", "/api/v1/contracts/"+f.contract, nil, nil), "c")["version"]
+	amend := func(v any, qty string) map[string]any {
+		return map[string]any{"version": v, "signed_on": "2026-10-10", "reason": "Khách giảm số lượng", "reference": "PL-01",
+			"lines": []any{map[string]any{"contract_line_id": f.line, "quantity": qty, "unit_price": "1"}}}
+	}
+	if r := e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/amendments", amend(version, "5"), key("am-low")); r.Status != 400 {
+		t.Fatalf("cannot go below the 6 delivered: %d %v", r.Status, r.Body)
+	}
+	if r := e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/amendments", amend(float64(0), "8"), key("am-stale")); r.reason() != "version_conflict" {
+		t.Fatalf("stale version: %v", r.Body)
+	}
+	am := e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/amendments", amend(version, "8"), key("am")), "amend to 8")
+	ch := am["lines"].([]any)[0].(map[string]any)
+	if am["number"] != "AM-26-0001-01" || ch["before"].(map[string]any)["quantity"] != "10" || ch["after"].(map[string]any)["quantity"] != "8" {
+		t.Fatalf("the amendment keeps before and after: %v", am)
+	}
+	if l := e.line(khoa, f); l["contract_quantity"] != "8" || l["remaining"] != "2" || l["over"] != "0" {
+		t.Fatalf("line follows the amendment: %v", l)
+	}
+	if r := e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/close", map[string]any{"reason": "Xong"}, key("close-early")); r.reason() != "contract_not_delivered" {
+		t.Fatalf("2 still to deliver: %v", r.Body)
+	}
+	e.deliver(khoa, f, "amd-rest", "2")
+	closed := e.must(200, e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/close", map[string]any{"reason": "Đã giao đủ"}, key("close")), "close")
+	if closed["status"] != "closed" {
+		t.Fatalf("closed: %v", closed["status"])
+	}
+	if r := e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/purchase-orders", map[string]any{"supplier_id": f.supplier, "currency": "VND",
+		"lines": []any{map[string]any{"contract_line_id": f.line, "quantity": "1", "unit_price": "1"}}}, nil); r.reason() != "contract_not_active" {
+		t.Fatalf("a closed contract takes no new orders: %v", r.Body)
+	}
+	e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/acceptances", map[string]any{"on": "2026-10-11", "evidence": "BB", "lines": []any{map[string]any{"contract_line_id": f.line, "quantity": "8"}}}, key("acc-closed")), "accept after closing")
+	ended := e.must(200, e.do(khoa, "GET", "/api/v1/contracts?tab=ended", nil, nil), "ended")
+	if ended["counts"].(map[string]any)["ended"].(float64) != 1 || len(ended["items"].([]any)) != 1 {
+		t.Fatalf("the ended tab lists it: %v", ended)
+	}
+	e.must(200, e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/reopen", map[string]any{"reason": "Khách đặt thêm"}, key("reopen")), "reopen")
+
+	// Cancel: refused while goods are still on order; allowed once that balance is closed.
+	g := e.activeContract(khoa, "CXL", "5")
+	po := e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+g.contract+"/purchase-orders", map[string]any{"supplier_id": g.supplier, "currency": "VND",
+		"lines": []any{map[string]any{"contract_line_id": g.line, "quantity": "5", "unit_price": "1"}}}, nil), "po")["id"].(string)
+	e.must(200, e.do(khoa, "POST", "/api/v1/purchase-orders/"+po+"/confirm", nil, key("cxl-po")), "confirm")
+	if r := e.do(khoa, "POST", "/api/v1/contracts/"+g.contract+"/cancel", map[string]any{"reason": "Khách hủy"}, key("cxl-early")); r.reason() != "contract_cancel_blocked" {
+		t.Fatalf("goods on order: %v", r.Body)
+	}
+	e.must(200, e.do(khoa, "POST", "/api/v1/purchase-orders/"+po+"/close", map[string]any{"reason": "Khách hủy"}, key("cxl-close-po")), "close PO balance")
+	if c := e.must(200, e.do(khoa, "POST", "/api/v1/contracts/"+g.contract+"/cancel", map[string]any{"reason": "Khách hủy"}, key("cxl")), "cancel"); c["status"] != "cancelled" {
+		t.Fatalf("cancelled: %v", c["status"])
+	}
+}

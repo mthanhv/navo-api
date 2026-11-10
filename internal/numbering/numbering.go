@@ -37,7 +37,8 @@ func NextYearly(ctx context.Context, tx pgx.Tx, docType string, year int) (int, 
 }
 
 // childCounters maps a document type to its counter column on contracts.
-var childCounters = map[string]string{"PO": "po_seq", "GR": "gr_seq", "DO": "do_seq", "SI": "si_seq"}
+var childCounters = map[string]string{"PO": "po_seq", "GR": "gr_seq", "DO": "do_seq", "SI": "si_seq",
+	"AC": "ac_seq", "CR": "cr_seq", "SR": "sr_seq", "AM": "am_seq"}
 
 // YearlyNumber formats {TYPE}-{yy}-{nnnn} for documents that span contracts (PI, RV, PV).
 func YearlyNumber(docType string, year, seq int) string {

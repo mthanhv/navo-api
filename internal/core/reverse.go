@@ -53,14 +53,17 @@ func (h *Handlers) ReverseFulfillment(kind string) gin.HandlerFunc {
 			}
 			if kind == "goods_receipt" {
 				var invalid bool
+				// Net stock must still cover net deliveries, and no PO line may end up having
+				// returned more to the supplier than it received.
 				if err := tx.QueryRow(ctx, `SELECT EXISTS (
      SELECT 1 FROM contract_lines cl WHERE cl.contract_id=$1 AND
-      coalesce((SELECT sum(g.accepted_quantity) FROM goods_receipt_lines g JOIN goods_receipts r ON r.id=g.goods_receipt_id JOIN purchase_order_lines pol ON pol.id=g.purchase_order_line_id WHERE pol.contract_line_id=cl.id AND r.status='confirmed' AND r.id<>$2),0)
-       < coalesce((SELECT sum(l.quantity) FROM delivery_order_lines l JOIN delivery_orders d ON d.id=l.delivery_order_id WHERE l.contract_line_id=cl.id AND d.status='confirmed'),0))`, contractID, id).Scan(&invalid); err != nil {
+      line_received(cl.id) - coalesce((SELECT sum(g.accepted_quantity) FROM goods_receipt_lines g JOIN purchase_order_lines pol ON pol.id=g.purchase_order_line_id WHERE g.goods_receipt_id=$2 AND pol.contract_line_id=cl.id),0)
+       < line_delivered(cl.id))
+    OR EXISTS (SELECT 1 FROM goods_receipt_lines g WHERE g.goods_receipt_id=$2 AND po_line_received(g.purchase_order_line_id) - g.accepted_quantity < 0)`, contractID, id).Scan(&invalid); err != nil {
 					return nil, err
 				}
 				if invalid {
-					return nil, apperrors.Rule("reversal_has_dependents", "Reverse dependent deliveries before this receipt.", nil)
+					return nil, apperrors.Rule("reversal_has_dependents", "Reverse dependent deliveries or supplier returns before this receipt.", nil)
 				}
 			} else {
 				// Serialize with finance allocation/trigger checks before reading
@@ -68,9 +71,13 @@ func (h *Handlers) ReverseFulfillment(kind string) gin.HandlerFunc {
 				if _, err := tx.Exec(ctx, `SELECT id FROM payment_milestones WHERE contract_id=$1 ORDER BY id FOR UPDATE`, contractID); err != nil {
 					return nil, err
 				}
+				// Accepted goods stay delivered: what remains delivered after this reversal must
+				// still cover acceptances (AC-07). A legacy hand-entered acceptance date or money
+				// collected on "after full delivery" also depends on this delivery.
 				var dependent bool
 				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM payment_milestones m WHERE m.contract_id=$1 AND (
-       m.trigger='acceptance' AND m.triggered_on IS NOT NULL OR m.trigger='delivery_complete' AND EXISTS(SELECT 1 FROM receipt_allocations a WHERE a.milestone_id=m.id AND a.reversed_at IS NULL)))`, contractID).Scan(&dependent); err != nil {
+       m.trigger='acceptance' AND m.triggered_on IS NOT NULL AND m.acceptance_id IS NULL OR m.trigger='delivery_complete' AND EXISTS(SELECT 1 FROM receipt_allocations a WHERE a.milestone_id=m.id AND a.reversed_at IS NULL)))
+    OR EXISTS(SELECT 1 FROM delivery_order_lines l WHERE l.delivery_order_id=$2 AND line_delivered(l.contract_line_id) - l.quantity < line_accepted(l.contract_line_id))`, contractID, id).Scan(&dependent); err != nil {
 					return nil, err
 				}
 				if dependent {

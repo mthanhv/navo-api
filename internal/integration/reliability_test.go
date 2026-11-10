@@ -225,10 +225,14 @@ func TestOperationalCorrections(t *testing.T) {
 	m := e.must(201, e.do(sales, "POST", "/api/v1/contracts/"+cid+"/milestones", map[string]any{"name": "Acceptance", "amount": "100", "trigger": "acceptance", "days_after": 0}, nil), "term")
 	mid := m["id"].(string)
 	event := map[string]any{"on": day, "note": "Signed customer acceptance reference AC-1"}
-	if r := e.do(sales, "POST", "/api/v1/milestones/"+mid+"/trigger", event, key("before-delivery")); r.reason() != "acceptance_requires_delivery" {
-		t.Fatalf("accepted before delivery: %v", r.Body)
+	if r := e.do(sales, "POST", "/api/v1/milestones/"+mid+"/trigger", event, key("by-hand")); r.reason() != "acceptance_from_documents" {
+		t.Fatalf("acceptance terms come from acceptance documents only: %v", r.Body)
 	}
 	line := lineByNo(k, 1)["contract_line_id"]
+	accept := map[string]any{"on": day, "evidence": "Signed customer acceptance reference AC-1", "lines": []any{map[string]any{"contract_line_id": line, "quantity": "10"}}}
+	if r := e.do(sales, "POST", "/api/v1/contracts/"+cid+"/acceptances", accept, key("before-delivery")); r.Status != 400 {
+		t.Fatalf("nothing is accepted before it is delivered: %v", r.Body)
+	}
 	po := e.must(201, e.do(sales, "POST", "/api/v1/contracts/"+cid+"/purchase-orders", map[string]any{"supplier_id": sup["id"], "currency": "VND", "lines": []any{map[string]any{"contract_line_id": line, "quantity": "10", "unit_price": "9"}}}, nil), "PO")
 	pid := po["id"].(string)
 	e.must(200, e.do(sales, "POST", "/api/v1/purchase-orders/"+pid+"/confirm", nil, key("op-po")), "PO confirm")
@@ -242,14 +246,17 @@ func TestOperationalCorrections(t *testing.T) {
 	if r := e.do(sales, "POST", "/api/v1/goods-receipts/"+gid+"/reverse", reason, key("gr-dependents")); r.reason() != "reversal_has_dependents" {
 		t.Fatalf("negative stock reversal: %v", r.Body)
 	}
-	e.must(200, e.do(sales, "POST", "/api/v1/milestones/"+mid+"/trigger", event, key("op-trigger")), "acceptance")
-	if r := e.do(sales, "POST", "/api/v1/milestones/"+mid+"/trigger", event, key("trigger-again")); r.reason() != "milestone_already_triggered" {
-		t.Fatalf("event overwritten: %v", r.Body)
+	acc := e.must(201, e.do(sales, "POST", "/api/v1/contracts/"+cid+"/acceptances", accept, key("op-accept")), "acceptance")
+	if r := e.do(sales, "POST", "/api/v1/contracts/"+cid+"/acceptances", accept, key("accept-again")); r.Status != 400 {
+		t.Fatalf("accepted twice: %v", r.Body)
 	}
 	if r := e.do(sales, "POST", "/api/v1/delivery-orders/"+did+"/reverse", reason, key("do-dependents")); r.reason() != "reversal_has_dependents" {
 		t.Fatalf("acceptance erased: %v", r.Body)
 	}
-	e.must(200, e.do(sales, "POST", "/api/v1/milestones/"+mid+"/reset", reason, key("op-reset")), "reset acceptance")
+	if r := e.do(sales, "POST", "/api/v1/milestones/"+mid+"/reset", reason, key("reset-doc")); r.reason() != "acceptance_from_documents" {
+		t.Fatalf("a document-made date is corrected by reversing the document: %v", r.Body)
+	}
+	e.must(200, e.do(sales, "POST", "/api/v1/acceptances/"+acc["id"].(string)+"/reverse", reason, key("op-reset")), "reverse acceptance")
 	e.must(200, e.do(sales, "POST", "/api/v1/delivery-orders/"+did+"/reverse", reason, key("op-do-rev")), "reverse DO")
 	e.must(200, e.do(sales, "POST", "/api/v1/goods-receipts/"+gid+"/reverse", reason, key("op-gr-rev")), "reverse GR")
 	e.must(200, e.do(sales, "POST", "/api/v1/purchase-orders/"+pid+"/close", reason, key("op-close")), "close remaining PO")
@@ -261,7 +268,7 @@ func TestOperationalCorrections(t *testing.T) {
 	var reversals, history int
 	e.pool.QueryRow(context.Background(), `SELECT count(*) FROM document_reversals`).Scan(&reversals)
 	e.pool.QueryRow(context.Background(), `SELECT count(*) FROM payment_term_history`).Scan(&history)
-	if reversals != 2 || history != 2 {
+	if reversals != 3 || history != 2 {
 		t.Fatalf("missing correction history: %d,%d", reversals, history)
 	}
 	t.Run("note replay and assignment handover", func(t *testing.T) {

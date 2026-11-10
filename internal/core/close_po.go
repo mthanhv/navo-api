@@ -59,7 +59,7 @@ func (h *Handlers) ClosePurchaseOrder(c *gin.Context) {
 		if drafts {
 			return nil, apperrors.Rule("has_draft_receipts", "Cancel draft receipts before closing the PO.", nil)
 		}
-		rows, err := tx.Query(ctx, `SELECT pol.id,(pol.quantity-pol.cancelled_quantity-coalesce((SELECT sum(l.accepted_quantity) FROM goods_receipt_lines l JOIN goods_receipts r ON r.id=l.goods_receipt_id WHERE l.purchase_order_line_id=pol.id AND r.status='confirmed'),0))::text FROM purchase_order_lines pol WHERE pol.purchase_order_id=$1 ORDER BY pol.id`, id)
+		rows, err := tx.Query(ctx, `SELECT pol.id,(pol.quantity-pol.cancelled_quantity-po_line_received(pol.id))::text FROM purchase_order_lines pol WHERE pol.purchase_order_id=$1 ORDER BY pol.id`, id)
 		if err != nil {
 			return nil, err
 		}

@@ -35,9 +35,8 @@ func (h *Handlers) ListPurchaseOrders(c *gin.Context) {
 	view := c.DefaultQuery("view", "awaiting")
 	const base = `
 WITH po_lines AS (
-    SELECT pol.purchase_order_id, pol.quantity, pol.expected_on,
-           coalesce((SELECT sum(grl.accepted_quantity) FROM goods_receipt_lines grl JOIN goods_receipts gr ON gr.id = grl.goods_receipt_id
-                     WHERE grl.purchase_order_line_id = pol.id AND gr.status = 'confirmed'), 0) AS received
+    SELECT pol.purchase_order_id, pol.quantity - pol.cancelled_quantity AS quantity, pol.expected_on,
+           po_line_received(pol.id) AS received
     FROM purchase_order_lines pol
 ), agg AS (
     SELECT purchase_order_id, count(*) AS lines, count(*) FILTER (WHERE received >= quantity) AS done,
