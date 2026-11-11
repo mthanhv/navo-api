@@ -398,7 +398,8 @@ func TestTwoStepSignIn(t *testing.T) {
 	if r := e.do(nam, "POST", "/api/v1/me/mfa/enable", map[string]any{"code": "000000"}, nil); r.Status != 400 {
 		t.Fatalf("a wrong code does not enable: %d", r.Status)
 	}
-	on := e.must(200, e.do(nam, "POST", "/api/v1/me/mfa/enable", map[string]any{"code": auth.CodeAt(secret, time.Now())}, nil), "enable")
+	enableCode := auth.CodeAt(secret, time.Now())
+	on := e.must(200, e.do(nam, "POST", "/api/v1/me/mfa/enable", map[string]any{"code": enableCode}, nil), "enable")
 	codes := on["recovery_codes"].([]any)
 	if len(codes) != 8 {
 		t.Fatalf("eight recovery codes, shown once: %v", codes)
@@ -409,7 +410,8 @@ func TestTwoStepSignIn(t *testing.T) {
 	if r := login(nil); r.reason() != "mfa_required" {
 		t.Fatalf("password alone no longer signs in: %v", r.Body)
 	}
-	if r := login(map[string]any{"code": auth.CodeAt(secret, time.Now())}); r.reason() != "invalid_mfa_code" {
+	// The exact code used to enable, whatever time it is now (a slow run may cross a step).
+	if r := login(map[string]any{"code": enableCode}); r.reason() != "invalid_mfa_code" {
 		t.Fatalf("the code used to enable cannot be replayed: %v", r.Body)
 	}
 	if r := login(map[string]any{"code": auth.CodeAt(secret, time.Now().Add(30*time.Second))}); r.Status != 200 {
