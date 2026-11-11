@@ -61,6 +61,7 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	})
 
 	authSvc := auth.NewService(pool, cfg.SessionTTL, cfg.CookieSecure)
+	authSvc.RequireAdminMFA = cfg.RequireAdminMFA
 	md := &masterdata.Handlers{Pool: pool}
 	co := &core.Handlers{Pool: pool, TZ: cfg.Timezone}
 	us := &users.Handlers{Pool: pool}
@@ -75,6 +76,10 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	a.POST("/auth/logout", authSvc.Logout)
 	a.GET("/me", authSvc.Me)
 	a.POST("/me/password", authSvc.ChangePassword)
+	a.POST("/me/mfa/setup", authSvc.SetupMFA)
+	a.POST("/me/mfa/enable", authSvc.EnableMFA)
+	a.POST("/me/mfa/disable", authSvc.DisableMFA)
+	a.POST("/users/:id/mfa/reset", need(access.UsersManage), authSvc.ResetMFA)
 
 	a.GET("/users", need(access.UsersManage), us.ListUsers)
 	a.POST("/users", need(access.UsersManage), us.CreateUser)

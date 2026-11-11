@@ -70,8 +70,12 @@ type Principal struct {
 	Roles   []Role    `json:"roles"`
 	Granted []string  `json:"grants"`
 	Version int64     `json:"-"`
-	perms   map[Permission]bool
-	seesAll bool
+	// MFAEnabled: two-step sign-in is on. MFAEnrollmentRequired: an admin who must turn it
+	// on before doing anything else (NAVO_REQUIRE_ADMIN_MFA).
+	MFAEnabled            bool `json:"mfa_enabled"`
+	MFAEnrollmentRequired bool `json:"mfa_enrollment_required"`
+	perms                 map[Permission]bool
+	seesAll               bool
 }
 
 // NewPrincipal resolves permissions from roles and explicit grants.
@@ -112,4 +116,14 @@ func (p *Principal) OwnerFilter() *uuid.UUID {
 	}
 	id := p.UserID
 	return &id
+}
+
+// HasRole reports whether the user holds role r.
+func (p *Principal) HasRole(r Role) bool {
+	for _, x := range p.Roles {
+		if x == r {
+			return true
+		}
+	}
+	return false
 }

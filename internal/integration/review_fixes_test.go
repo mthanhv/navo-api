@@ -3,7 +3,11 @@
 package integration
 
 import (
+	"strings"
 	"testing"
+	"time"
+
+	"navo-api/internal/auth"
 )
 
 // fixture is an active contract with one line, plus the partners and product behind it.
@@ -361,4 +365,69 @@ func TestAmendCloseCancel(t *testing.T) {
 	if c := e.must(200, e.do(khoa, "POST", "/api/v1/contracts/"+g.contract+"/cancel", map[string]any{"reason": "Khách hủy"}, key("cxl")), "cancel"); c["status"] != "cancelled" {
 		t.Fatalf("cancelled: %v", c["status"])
 	}
+}
+
+// Two-step sign-in: set up with an authenticator code, then every login needs a fresh code
+// or a one-time recovery code; a code never works twice; another admin resets a lost phone.
+func TestTwoStepSignIn(t *testing.T) {
+	e := setup(t)
+	e.user("nam@test.vn", []string{"admin"})
+	e.user("lan@test.vn", []string{"admin"})
+	nam, lan := e.login("nam@test.vn"), e.login("lan@test.vn")
+	login := func(extra map[string]any) result {
+		body := map[string]any{"email": "nam@test.vn", "password": "correct-horse-1", "client": "mobile"}
+		for k, v := range extra {
+			body[k] = v
+		}
+		return e.do("", "POST", "/api/v1/auth/login", body, nil)
+	}
+	set := e.must(200, e.do(nam, "POST", "/api/v1/me/mfa/setup", nil, nil), "setup")
+	secret := set["secret"].(string)
+	if !strings.HasPrefix(set["uri"].(string), "otpauth://totp/Navo:nam@test.vn?") {
+		t.Fatalf("authenticator link: %v", set["uri"])
+	}
+	if r := login(nil); r.Status != 200 {
+		t.Fatalf("nothing changes until a code is confirmed: %d", r.Status)
+	}
+	if r := e.do(nam, "POST", "/api/v1/me/mfa/enable", map[string]any{"code": "000000"}, nil); r.Status != 400 {
+		t.Fatalf("a wrong code does not enable: %d", r.Status)
+	}
+	on := e.must(200, e.do(nam, "POST", "/api/v1/me/mfa/enable", map[string]any{"code": auth.CodeAt(secret, time.Now())}, nil), "enable")
+	codes := on["recovery_codes"].([]any)
+	if len(codes) != 8 {
+		t.Fatalf("eight recovery codes, shown once: %v", codes)
+	}
+	if me := e.must(200, e.do(nam, "GET", "/api/v1/me", nil, nil), "me")["user"].(map[string]any); me["mfa_enabled"] != true {
+		t.Fatalf("me shows two-step is on: %v", me)
+	}
+	if r := login(nil); r.reason() != "mfa_required" {
+		t.Fatalf("password alone no longer signs in: %v", r.Body)
+	}
+	if r := login(map[string]any{"code": auth.CodeAt(secret, time.Now())}); r.reason() != "invalid_mfa_code" {
+		t.Fatalf("the code used to enable cannot be replayed: %v", r.Body)
+	}
+	if r := login(map[string]any{"code": auth.CodeAt(secret, time.Now().Add(30*time.Second))}); r.Status != 200 {
+		t.Fatalf("the next code signs in: %d %v", r.Status, r.Body)
+	}
+	if r := login(map[string]any{"recovery_code": codes[0]}); r.Status != 200 {
+		t.Fatalf("a recovery code signs in: %d", r.Status)
+	}
+	if r := login(map[string]any{"recovery_code": codes[0]}); r.reason() != "invalid_mfa_code" {
+		t.Fatalf("a recovery code works once: %v", r.Body)
+	}
+	if r := e.do(nam, "POST", "/api/v1/users/"+e.userID(nam)+"/mfa/reset", nil, nil); r.reason() != "mfa_reset_self" {
+		t.Fatalf("nobody resets their own second step: %v", r.Body)
+	}
+	e.must(200, e.do(lan, "POST", "/api/v1/users/"+e.userID(nam)+"/mfa/reset", nil, nil), "another admin resets")
+	if r := e.do(nam, "GET", "/api/v1/me", nil, nil); r.Status != 401 {
+		t.Fatalf("a reset ends the person's sessions: %d", r.Status)
+	}
+	if r := login(nil); r.Status != 200 {
+		t.Fatalf("after the reset the password signs in again: %d", r.Status)
+	}
+}
+
+func (e *env) userID(token string) string {
+	e.t.Helper()
+	return e.must(200, e.do(token, "GET", "/api/v1/me", nil, nil), "me")["user"].(map[string]any)["id"].(string)
 }
