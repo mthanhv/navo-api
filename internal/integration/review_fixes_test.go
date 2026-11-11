@@ -3,11 +3,13 @@
 package integration
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
 	"navo-api/internal/auth"
+	"navo-api/internal/db"
 )
 
 // fixture is an active contract with one line, plus the partners and product behind it.
@@ -430,4 +432,31 @@ func TestTwoStepSignIn(t *testing.T) {
 func (e *env) userID(token string) string {
 	e.t.Helper()
 	return e.must(200, e.do(token, "GET", "/api/v1/me", nil, nil), "me")["user"].(map[string]any)["id"].(string)
+}
+
+// Housekeeping removes long-finished sessions and old command results, never a live
+// session or a person's most recent one.
+func TestPurgeKeepsWhatMatters(t *testing.T) {
+	e := setup(t)
+	e.user("khoa@test.vn", []string{"sales"})
+	live := e.login("khoa@test.vn")
+	ctx := context.Background()
+	old := time.Now().Add(-db.Retention - 24*time.Hour)
+	uid := e.userID(live)
+	for i, created := range []time.Time{old.Add(-2 * time.Hour), old.Add(-time.Hour)} {
+		if _, err := e.pool.Exec(ctx, `INSERT INTO sessions (user_id, token_hash, client, created_at, expires_at) VALUES ($1, $2, 'web', $3, $4)`,
+			uid, []byte{byte(i), 1, 2, 3}, created, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.pool.Exec(ctx, `INSERT INTO idempotency_records (actor_id, scope, key, request_hash, created_at) VALUES ($1, 'x', 'old-key-1', '\x00', $2), ($1, 'x', 'new-key-1', '\x00', now())`, uid, old); err != nil {
+		t.Fatal(err)
+	}
+	sessions, results, err := db.Purge(ctx, e.pool)
+	if err != nil || sessions != 2 || results != 1 {
+		t.Fatalf("purged %d sessions, %d results, err %v; want 2, 1", sessions, results, err)
+	}
+	if r := e.do(live, "GET", "/api/v1/me", nil, nil); r.Status != 200 {
+		t.Fatalf("the live session survives: %d", r.Status)
+	}
 }

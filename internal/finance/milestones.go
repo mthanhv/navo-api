@@ -63,6 +63,8 @@ type Milestone struct {
 	// TriggeredOn is when the event happened (signing, last delivery, acceptance…); nil = not yet.
 	TriggeredOn *string `json:"triggered_on"`
 	TriggerNote *string `json:"trigger_note"`
+	// AcceptanceID is the acceptance document that made an "after acceptance" term due.
+	AcceptanceID *uuid.UUID `json:"acceptance_id"`
 	// Source names the event: "DO-26-0129-01" for full delivery, the note for acceptance.
 	Source string           `json:"source"`
 	DueOn  *string          `json:"due_on"`
@@ -77,7 +79,7 @@ type Milestone struct {
 // signing date and, for "after full delivery", whether every line is delivered and the last delivery.
 const milestoneSQL = `
 SELECT m.id, m.contract_id, c.number, c.customer_id, cu.name, m.seq, m.version, m.name, m.percent::text, m.amount::text, c.currency, m.trigger,
-       m.days_after, m.fixed_due_on, m.triggered_on, m.trigger_note, c.signed_on,
+       m.days_after, m.fixed_due_on, m.triggered_on, m.trigger_note, m.acceptance_id, c.signed_on,
        NOT EXISTS (SELECT 1 FROM contract_lines cl WHERE cl.contract_id = c.id AND cl.quantity > line_delivered(cl.id)) AS fully_delivered,
        (SELECT d.number || ' ' || d.delivered_on::text FROM delivery_orders d WHERE d.contract_id = c.id AND d.status = 'confirmed'
         ORDER BY d.delivered_on DESC, d.number DESC LIMIT 1) AS last_delivery,
@@ -101,7 +103,7 @@ func (h *Handlers) loadMilestones(ctx context.Context, q db.Querier, where strin
 		var fullyDelivered bool
 		var lastDelivery *string
 		if err := rows.Scan(&m.ID, &m.ContractID, &number, &m.CustomerID, &m.CustomerName, &m.Seq, &m.Version, &m.Name, &percent, &amount, &m.Currency, &m.Trigger,
-			&m.DaysAfter, &fixed, &triggered, &m.TriggerNote, &signed, &fullyDelivered, &lastDelivery, &paid); err != nil {
+			&m.DaysAfter, &fixed, &triggered, &m.TriggerNote, &m.AcceptanceID, &signed, &fullyDelivered, &lastDelivery, &paid); err != nil {
 			return nil, err
 		}
 		if number != nil {

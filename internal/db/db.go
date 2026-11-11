@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -104,4 +105,26 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool, files fs.FS) ([]string, er
 		}
 	}
 	return applied, nil
+}
+
+// Retention is how long finished sessions and stored command results are kept. A retry of
+// a command arrives within minutes; ninety days is far beyond any real retry.
+const Retention = 90 * 24 * time.Hour
+
+// Purge deletes sessions that ended more than Retention ago (keeping each person's most
+// recent one, which is their "last signed in") and command results older than Retention.
+// Business records and the audit log are never purged.
+func Purge(ctx context.Context, pool *pgxpool.Pool) (sessions, results int64, err error) {
+	cutoff := time.Now().Add(-Retention)
+	tag, err := pool.Exec(ctx, `DELETE FROM sessions s WHERE coalesce(s.revoked_at, s.expires_at) < $1
+		AND s.created_at < (SELECT max(created_at) FROM sessions x WHERE x.user_id = s.user_id)`, cutoff)
+	if err != nil {
+		return 0, 0, err
+	}
+	sessions = tag.RowsAffected()
+	tag, err = pool.Exec(ctx, `DELETE FROM idempotency_records WHERE created_at < $1`, cutoff)
+	if err != nil {
+		return sessions, 0, err
+	}
+	return sessions, tag.RowsAffected(), nil
 }

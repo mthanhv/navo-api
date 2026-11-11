@@ -42,6 +42,25 @@ func run() error {
 	}
 	defer pool.Close()
 
+	// Housekeeping: once at start and then daily, drop long-finished sessions and old
+	// command results so those tables do not grow for ever.
+	go func() {
+		tick := time.NewTicker(24 * time.Hour)
+		defer tick.Stop()
+		for {
+			if sessions, results, err := db.Purge(ctx, pool); err != nil {
+				slog.Warn("housekeeping failed", "error", err)
+			} else if sessions+results > 0 {
+				slog.Info("housekeeping", "sessions_deleted", sessions, "command_results_deleted", results)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
+		}
+	}()
+
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           router.New(cfg, pool),
