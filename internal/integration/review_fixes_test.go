@@ -3,7 +3,11 @@
 package integration
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"mime/multipart"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -458,5 +462,97 @@ func TestPurgeKeepsWhatMatters(t *testing.T) {
 	}
 	if r := e.do(live, "GET", "/api/v1/me", nil, nil); r.Status != 200 {
 		t.Fatalf("the live session survives: %d", r.Status)
+	}
+}
+
+func (e *env) importFile(token, kind, step, name string, content []byte, hash string) result {
+	e.t.Helper()
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	if hash != "" {
+		_ = w.WriteField("file_hash", hash)
+	}
+	fw, _ := w.CreateFormFile("file", name)
+	_, _ = fw.Write(content)
+	_ = w.Close()
+	req, _ := http.NewRequest("POST", e.srv.URL+"/api/v1/imports/"+kind+"/"+step, &buf)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return result{Status: resp.StatusCode, Body: out}
+}
+
+// Starting data loads by preview then commit (AC-20): each row has an outcome and reason;
+// near-matches are conflicts for a person, never merged; the same file twice creates nothing.
+func TestMasterDataImport(t *testing.T) {
+	e := setup(t)
+	e.user("khoa@test.vn", []string{"sales"})
+	e.user("lan@test.vn", []string{"leader"})
+	khoa, lan := e.login("khoa@test.vn"), e.login("lan@test.vn")
+	e.must(201, e.do(khoa, "POST", "/api/v1/organizations", map[string]any{"code": "STRA", "name": "Lọc hóa dầu Sông Trà", "is_customer": true, "tax_code": "0101234567"}, nil), "existing")
+	csv := []byte("Mã;Tên;Mã số thuế;Khách hàng;Nhà cung cấp;Người liên hệ;Email\n" +
+		"STRA;Lọc hóa dầu Sông Trà;;x;;;\n" + // exists (no tax code given: matches by code)
+		"DPN;Đạm Phương Nam;0309999999;x;;Trần Huy;huy@dpn.vn\n" + // new, with contact
+		"STR2;Sông Trà khác mã;0101234567;x;;;\n" + // conflict: tax code used by STRA
+		"KDH;Khí Đông Hải;;;;;\n" + // error: neither customer nor supplier
+		"DPN;Trùng mã;;x;;;\n" + // error: duplicate code in file
+		"DA;Thiết bị Đông Á;;;x;Mr Kim;not-an-email\n") // error: email
+	if r := e.importFile(lan, "partners", "preview", "p.csv", csv, ""); r.Status != 403 {
+		t.Fatalf("leaders do not import: %d", r.Status)
+	}
+	pv := e.importFile(khoa, "partners", "preview", "p.csv", csv, "")
+	if pv.Status != 200 {
+		t.Fatalf("preview: %d %v", pv.Status, pv.Body)
+	}
+	d := pv.data()
+	c := d["counts"].(map[string]any)
+	if c["new"].(float64) != 1 || c["exists"].(float64) != 1 || c["conflict"].(float64) != 1 || c["error"].(float64) != 3 {
+		t.Fatalf("outcomes: %v rows %v", c, d["rows"])
+	}
+	var orgs int
+	e.pool.QueryRow(context.Background(), `SELECT count(*) FROM organizations`).Scan(&orgs)
+	if orgs != 1 {
+		t.Fatalf("preview saves nothing: %d", orgs)
+	}
+	if r := e.importFile(khoa, "partners", "commit", "p.csv", csv, "not-the-hash"); r.reason() != "import_file_changed" {
+		t.Fatalf("commit only the previewed file: %v", r.Body)
+	}
+	hash := d["file_hash"].(string)
+	done := e.must(200, e.importFile(khoa, "partners", "commit", "p.csv", csv, hash), "commit")
+	if done["created"].(float64) != 1 {
+		t.Fatalf("only the new row is created: %v", done)
+	}
+	dpn := e.must(200, e.do(khoa, "GET", "/api/v1/organizations?q=DPN", nil, nil), "dpn")["items"].([]any)[0].(map[string]any)
+	if dpn["primary_contact"] != "Trần Huy" || dpn["owner_name"] != "khoa@test.vn" {
+		t.Fatalf("contact and owner come with the import: %v", dpn)
+	}
+	again := e.must(200, e.importFile(khoa, "partners", "commit", "p.csv", csv, hash), "again")
+	if again["created"].(float64) != 0 || again["counts"].(map[string]any)["exists"].(float64) != 2 {
+		t.Fatalf("the same file twice creates nothing: %v", again)
+	}
+
+	// Products: a maker code identifies an item; same name with a code is a conflict.
+	e.must(201, e.do(khoa, "POST", "/api/v1/products", map[string]any{"name": "Van cầu DN50", "unit": "bộ", "manufacturer": "KSB", "manufacturer_code": "BOA-50"}, nil), "product")
+	pcsv := []byte("Tên sản phẩm,Đơn vị,Hãng,Mã hãng,Mã NCC\n" +
+		"Van cầu DN50,bộ,KSB,BOA-50,\n" + // exists
+		"Van cầu DN50,bộ,ARI,ARI-50,\n" + // conflict: same name, other maker
+		"Gioăng DN100,cái,,,\n" + // new
+		"Bơm,,,,\n" + // error: unit
+		"Van bi,cái,,,NOPE\n") // error: unknown supplier
+	pp := e.importFile(khoa, "products", "preview", "p.csv", pcsv, "").data()
+	if c := pp["counts"].(map[string]any); c["new"].(float64) != 1 || c["exists"].(float64) != 1 || c["conflict"].(float64) != 1 || c["error"].(float64) != 2 {
+		t.Fatalf("product outcomes: %v", pp["rows"])
+	}
+	if got := e.must(200, e.importFile(khoa, "products", "commit", "p.csv", pcsv, pp["file_hash"].(string)), "products"); got["created"].(float64) != 1 {
+		t.Fatalf("one product created: %v", got)
+	}
+	if r := e.importFile(khoa, "products", "preview", "x.csv", []byte("a,b\n1,2\n"), ""); r.reason() != "import_header_missing" {
+		t.Fatalf("a file without the columns is refused: %v", r.Body)
 	}
 }

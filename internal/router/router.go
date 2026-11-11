@@ -21,6 +21,7 @@ import (
 	"navo-api/internal/documents"
 	"navo-api/internal/files"
 	"navo-api/internal/finance"
+	"navo-api/internal/imports"
 	"navo-api/internal/mailer"
 	"navo-api/internal/masterdata"
 	"navo-api/internal/middleware"
@@ -210,6 +211,12 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	a.GET("/misa/exports/:id/file", need(access.FinanceWrite), ms.File)
 	a.PUT("/misa/codes", need(access.FinanceWrite), ms.SetCode)
 	a.POST("/misa/import", need(access.FinanceWrite), ms.Import)
+
+	// Starting master data (customers, suppliers, products): preview, then commit.
+	imp := &imports.Handlers{Pool: pool}
+	a.GET("/imports/:kind/template", need(access.ContractsRead), imp.Template)
+	a.POST("/imports/:kind/preview", need(access.ContractsRead), imp.Preview)
+	a.POST("/imports/:kind/commit", need(access.ContractsRead), imp.Commit)
 
 	a.GET("/reports/contract-lines", need(access.ContractsRead), co.ReportContractLines)
 	a.GET("/reports/overview", need(access.ContractsRead), co.ReportOverview)
