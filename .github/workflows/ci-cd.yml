@@ -46,8 +46,18 @@ jobs:
       - name: Integration tests (real PostgreSQL)
         run: go test -tags=integration -race -count=1 ./...
 
+  # The browser and API journeys against this commit and the matching branch (else main)
+  # of the other repository. The image is built only when this pair works together.
+  # Needs: secret SUT_READ_TOKEN (read access to the navo repositories) and navo-at's
+  # Actions setting "Accessible from repositories owned by the user".
+  journeys:
+    uses: mthanhv/navo-at/.github/workflows/e2e.yml@main
+    with:
+      api_ref: ${{ github.sha }}
+    secrets: inherit
+
   build:
-    needs: check
+    needs: [check, journeys]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04-arm
     permissions:
