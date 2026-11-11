@@ -34,9 +34,12 @@ const (
 	FulfillmentWrite   Permission = "fulfillment.write"
 	FulfillmentConfirm Permission = "fulfillment.confirm"
 	PartnersWrite      Permission = "partners.write"
-	CatalogWrite       Permission = "catalog.write"
-	ReportsOperations  Permission = "reports.operations"
-	UsersManage        Permission = "users.manage"
+	// ContactsWrite changes and emails the people at a partner. Which customers is
+	// decided per record (crm.manageable): owners, open-contract owners, whole-company roles.
+	ContactsWrite     Permission = "contacts.write"
+	CatalogWrite      Permission = "catalog.write"
+	ReportsOperations Permission = "reports.operations"
+	UsersManage       Permission = "users.manage"
 	// Sensitive grants: never implied by a role title, granted one by one.
 	PurchaseCostRead Permission = "purchase_cost.read"
 	FinanceRead      Permission = "finance.read"
@@ -49,14 +52,14 @@ const (
 var Grantable = map[Permission]bool{PurchaseCostRead: true, FinanceRead: true, QuantityOverride: true, FulfillmentConfirm: true}
 
 var roleDefaults = map[Role][]Permission{
-	Sales:      {ContractsRead, ContractsWrite, ProcurementWrite, FulfillmentWrite, FulfillmentConfirm, PartnersWrite, CatalogWrite, ReportsOperations},
-	Leader:     {ContractsRead, ReportsOperations},
+	Sales:      {ContractsRead, ContractsWrite, ProcurementWrite, FulfillmentWrite, FulfillmentConfirm, PartnersWrite, ContactsWrite, CatalogWrite, ReportsOperations},
+	Leader:     {ContractsRead, ReportsOperations, ContactsWrite},
 	Accounting: {ContractsRead, PurchaseCostRead, FinanceRead, FinanceWrite},
 	Admin:      all,
 }
 
 // all is every permission; the admin role holds it.
-var all = []Permission{ContractsRead, ContractsWrite, ProcurementWrite, FulfillmentWrite, FulfillmentConfirm, PartnersWrite, CatalogWrite,
+var all = []Permission{ContractsRead, ContractsWrite, ProcurementWrite, FulfillmentWrite, FulfillmentConfirm, PartnersWrite, ContactsWrite, CatalogWrite,
 	ReportsOperations, UsersManage, PurchaseCostRead, FinanceRead, FinanceWrite, QuantityOverride}
 
 // Principal is the signed-in user with resolved permissions.
@@ -66,8 +69,13 @@ type Principal struct {
 	Email   string    `json:"email"`
 	Roles   []Role    `json:"roles"`
 	Granted []string  `json:"grants"`
-	perms   map[Permission]bool
-	seesAll bool
+	Version int64     `json:"-"`
+	// MFAEnabled: two-step sign-in is on. MFAEnrollmentRequired: an admin who must turn it
+	// on before doing anything else (NAVO_REQUIRE_ADMIN_MFA).
+	MFAEnabled            bool `json:"mfa_enabled"`
+	MFAEnrollmentRequired bool `json:"mfa_enrollment_required"`
+	perms                 map[Permission]bool
+	seesAll               bool
 }
 
 // NewPrincipal resolves permissions from roles and explicit grants.
@@ -108,4 +116,14 @@ func (p *Principal) OwnerFilter() *uuid.UUID {
 	}
 	id := p.UserID
 	return &id
+}
+
+// HasRole reports whether the user holds role r.
+func (p *Principal) HasRole(r Role) bool {
+	for _, x := range p.Roles {
+		if x == r {
+			return true
+		}
+	}
+	return false
 }

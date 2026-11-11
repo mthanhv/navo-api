@@ -8,8 +8,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -52,7 +54,9 @@ type Service struct {
 	Pool         *pgxpool.Pool
 	TTL          time.Duration
 	CookieSecure bool
-	limiter      *limiter
+	// RequireAdminMFA makes admins turn on two-step sign-in before anything else.
+	RequireAdminMFA bool
+	limiter         *limiter
 }
 
 // NewService builds the service.
@@ -72,6 +76,10 @@ type loginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 	Client   string `json:"client"`
+	// Code is the authenticator code, or RecoveryCode a one-time recovery code, when the
+	// account has two-step sign-in on. Without either the answer is reason "mfa_required".
+	Code         string `json:"code"`
+	RecoveryCode string `json:"recovery_code"`
 }
 
 // Login handles POST /auth/login.
@@ -102,6 +110,12 @@ func (s *Service) Login(c *gin.Context) {
 		response.Fail(c, err)
 		return
 	}
+	// Per account as well as per address: guessing one person's password from many
+	// addresses is slowed to the same ten tries a minute.
+	if !s.limiter.allow("login:" + strings.ToLower(strings.TrimSpace(req.Email))) {
+		response.Fail(c, apperrors.TooManyRequests())
+		return
+	}
 	ctx := c.Request.Context()
 	var userID uuid.UUID
 	var hash string
@@ -118,6 +132,10 @@ func (s *Service) Login(c *gin.Context) {
 	}
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)) != nil {
 		response.Fail(c, apperrors.Rule("invalid_credentials", "Email or password is incorrect.", nil))
+		return
+	}
+	if err := s.secondFactor(ctx, userID, req.Code, req.RecoveryCode); err != nil {
+		response.Fail(c, err)
 		return
 	}
 	raw := make([]byte, 32)
@@ -196,8 +214,17 @@ func (s *Service) Authenticate() gin.HandlerFunc {
 			response.Fail(c, err)
 			return
 		}
+		p.MFAEnrollmentRequired = s.RequireAdminMFA && p.HasRole(access.Admin) && !p.MFAEnabled
+		if p.MFAEnrollmentRequired && !enrollmentAllowed(c.Request.Method, c.FullPath()) {
+			response.Fail(c, apperrors.Forbidden("mfa_enrollment_required"))
+			return
+		}
 		c.Set(principalKey, p)
-		c.Request = c.Request.WithContext(reqctx.WithActor(ctx, userID))
+		perms := p.Permissions()
+		sort.Slice(perms, func(i, j int) bool { return perms[i] < perms[j] })
+		encoded, _ := json.Marshal([]any{p.Version, perms, p.OwnerFilter()})
+		fingerprint := sha256.Sum256(encoded)
+		c.Request = c.Request.WithContext(reqctx.WithAuthorization(reqctx.WithActor(ctx, userID), fingerprint[:]))
 		c.Next()
 	}
 }
@@ -205,10 +232,12 @@ func (s *Service) Authenticate() gin.HandlerFunc {
 func (s *Service) loadPrincipal(ctx context.Context, userID uuid.UUID) (*access.Principal, error) {
 	var name, email string
 	var roles, grants []string
-	err := s.Pool.QueryRow(ctx, `SELECT u.full_name, u.email,
+	var version int64
+	var mfa bool
+	err := s.Pool.QueryRow(ctx, `SELECT u.full_name, u.email, u.version, u.totp_enabled_at IS NOT NULL,
 			coalesce((SELECT array_agg(role ORDER BY role) FROM user_roles WHERE user_id = u.id), '{}'),
 			coalesce((SELECT array_agg(grant_code ORDER BY grant_code) FROM user_grants WHERE user_id = u.id), '{}')
-		FROM users u WHERE u.id = $1`, userID).Scan(&name, &email, &roles, &grants)
+		FROM users u WHERE u.id = $1`, userID).Scan(&name, &email, &version, &mfa, &roles, &grants)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +245,9 @@ func (s *Service) loadPrincipal(ctx context.Context, userID uuid.UUID) (*access.
 	for i, r := range roles {
 		rs[i] = access.Role(r)
 	}
-	return access.NewPrincipal(userID, name, email, rs, grants), nil
+	p := access.NewPrincipal(userID, name, email, rs, grants)
+	p.Version, p.MFAEnabled = version, mfa
+	return p, nil
 }
 
 // Principal returns the signed-in user; Authenticate must have run.

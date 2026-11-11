@@ -50,9 +50,21 @@ result (`Idempotent-Replayed: true`).
 | GET, POST | `/api/v1/organizations/:id/contacts`; PATCH, DELETE `/contacts/:id` (many contacts per customer/supplier, one main) | contracts.read / partners.write |
 | GET | `/api/v1/contacts/emailable` (customer contacts with an address who accept product news) | partners.write |
 | GET | `/api/v1/mailings`, `/mailings/:id`, `/mailings/status` | contracts.read (sales: own) |
+| GET | `/api/v1/contracts/:id/history` (who changed the contract and its documents, and why) | contracts.read |
+| POST | `/api/v1/contracts/:id/close`, `/cancel`, `/reopen` `{reason}` (Idempotency-Key) | contracts.write |
+| POST | `/api/v1/contracts/:id/amendments` `{version, signed_on, reference?, reason, lines[], new_lines[]}` | contracts.write |
+| POST | `/api/v1/contracts/:id/acceptances`, `/contracts/:id/customer-returns` `{on, evidence\|reason, lines[{contract_line_id, quantity}]}`; `/purchase-orders/:id/supplier-returns` `{on, reason, lines[{purchase_order_line_id, quantity}]}`; `/acceptances\|customer-returns\|supplier-returns/:id/reverse` `{reason}` | fulfillment.confirm |
+| POST | `/api/v1/me/mfa/setup`, `/me/mfa/enable {code}`, `/me/mfa/disable {password, code}`; `/users/:id/mfa/reset` (users.manage, not yourself) | signed in |
+| GET, POST | `/api/v1/imports/partners\|products/template`, `/preview`, `/commit` (multipart `file`; commit needs `file_hash`) | partners.write / catalog.write |
 | POST | `/api/v1/mailings/preview`; `/mailings` `{subject, body, product_ids, contact_ids}` (Idempotency-Key; one copy per contact, sent in the background) | partners.write |
 
-Admin holds every permission and sees the whole company. Products also carry `description`,
+Admin holds every permission and sees the whole company, cannot decide their own
+over-quantity request, and with `NAVO_REQUIRE_ADMIN_MFA=true` (production) must turn on
+two-step sign-in before anything else. Login accepts `code` or `recovery_code` and answers
+reason `mfa_required` when one is needed. Contacts: everyone reads; changing and emailing a
+customer's contacts needs `contacts.write` and being its owner, an owner of one of its open
+contracts, or a whole-company role. Net received/delivered/accepted come from SQL functions
+(migration 016); see `docs/REVIEW_2026-11-11.md`. Products also carry `description`,
 `origin`, `supplier_id` (optional usual supplier) and `supplier_item_code`. Email needs
 `NAVO_SMTP_HOST` and `NAVO_MAIL_FROM` (see `.env.example`); without them sending answers
 `email_disabled` and everything else works.
@@ -77,8 +89,10 @@ Field codes: `required`, `too_long`, `format`, `decimal`, `greater_than`, `less_
 `over_ordered` (warning); `under_ordered` (info); `completed`. Window for `stock_short` is
 `company_settings.alert_horizon_days` (default 14).
 
-## Not yet built (next increments)
+## Current workflows and limits
 
-Returns and reversals, acceptance,
-amendments, finance (invoices, receipts/payments, allocations), files and documents tree,
-CRM notes/tasks, MISA export, AI drafts, OpenAPI file and backup runbook.
+Implemented: contract drafts/activation and draft editing; PO/GR/DO creation, confirmation and quantity approvals; full GR/DO reversal and closing outstanding PO quantities; versioned payment terms, evidenced full-delivery acceptance, invoices, receipts/payments and reversible allocations; scoped files/ZIP, notes/tasks, contacts/mailings, MISA code exchange and frozen export files, AI-assisted drafts, and selected assignment handover.
+
+See [reliability and API details](docs/RELIABILITY.md), [assessment baseline](docs/PRODUCT_REVIEW_2026-11-10.md), [remediation status and release limits](docs/REMEDIATION.md), and [the 11 November review and fixes](docs/REVIEW_2026-11-11.md).
+
+Partial physical returns, active commercial amendments, contract close/cancel, opening-data onboarding/import, real-MISA template acceptance, and a maintained OpenAPI schema remain incomplete. Do not infer these from status columns or historical requirements. There is no subscription billing or tenant model: one business uses each installation.

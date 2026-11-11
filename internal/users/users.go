@@ -34,6 +34,8 @@ type User struct {
 	Grants   []string  `json:"grants"`
 	// LastSignInAt is when the user last signed in (any device), nil if never.
 	LastSignInAt *time.Time `json:"last_sign_in_at"`
+	// MFAEnabled: the person signs in with a second step (authenticator app).
+	MFAEnabled bool `json:"mfa_enabled"`
 }
 
 // Input creates a user.
@@ -139,7 +141,7 @@ func (h *Handlers) ListUsers(c *gin.Context) {
 	rows, err := h.Pool.Query(c.Request.Context(), `SELECT u.id, u.email, u.full_name, u.is_active,
 			coalesce((SELECT array_agg(role ORDER BY role) FROM user_roles WHERE user_id = u.id), '{}'),
 			coalesce((SELECT array_agg(grant_code ORDER BY grant_code) FROM user_grants WHERE user_id = u.id), '{}'),
-			(SELECT max(created_at) FROM sessions WHERE user_id = u.id),
+			(SELECT max(created_at) FROM sessions WHERE user_id = u.id), u.totp_enabled_at IS NOT NULL,
 			count(*) OVER ()
 		FROM users u ORDER BY u.full_name, u.id LIMIT $1 OFFSET $2`, size, (page-1)*size)
 	if err != nil {
@@ -151,7 +153,7 @@ func (h *Handlers) ListUsers(c *gin.Context) {
 	total := 0
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.Email, &u.FullName, &u.IsActive, &u.Roles, &u.Grants, &u.LastSignInAt, &total); err != nil {
+		if err := rows.Scan(&u.ID, &u.Email, &u.FullName, &u.IsActive, &u.Roles, &u.Grants, &u.LastSignInAt, &u.MFAEnabled, &total); err != nil {
 			response.Fail(c, err)
 			return
 		}
@@ -224,7 +226,7 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 				return nil, apperrors.Forbidden("grant_" + g)
 			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE users SET full_name = $2, is_active = $3, updated_at = now() WHERE id = $1`, id, in.FullName, in.IsActive); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE users SET full_name = $2, is_active = $3, version = version + 1, updated_at = now() WHERE id = $1`, id, in.FullName, in.IsActive); err != nil {
 			return nil, err
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM user_roles WHERE user_id = $1 AND NOT (role = ANY($2))`, id, in.Roles); err != nil {

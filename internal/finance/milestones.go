@@ -52,6 +52,7 @@ type Milestone struct {
 	CustomerID     uuid.UUID        `json:"customer_id"`
 	CustomerName   string           `json:"customer_name"`
 	Seq            int              `json:"seq"`
+	Version        int64            `json:"version"`
 	Name           string           `json:"name"`
 	Percent        *decimal.Decimal `json:"percent"`
 	Amount         decimal.Decimal  `json:"amount"`
@@ -62,6 +63,8 @@ type Milestone struct {
 	// TriggeredOn is when the event happened (signing, last delivery, acceptance…); nil = not yet.
 	TriggeredOn *string `json:"triggered_on"`
 	TriggerNote *string `json:"trigger_note"`
+	// AcceptanceID is the acceptance document that made an "after acceptance" term due.
+	AcceptanceID *uuid.UUID `json:"acceptance_id"`
 	// Source names the event: "DO-26-0129-01" for full delivery, the note for acceptance.
 	Source string           `json:"source"`
 	DueOn  *string          `json:"due_on"`
@@ -75,11 +78,9 @@ type Milestone struct {
 // milestoneSQL loads milestones with what decides their trigger date: the contract's
 // signing date and, for "after full delivery", whether every line is delivered and the last delivery.
 const milestoneSQL = `
-SELECT m.id, m.contract_id, c.number, c.customer_id, cu.name, m.seq, m.name, m.percent::text, m.amount::text, c.currency, m.trigger,
-       m.days_after, m.fixed_due_on, m.triggered_on, m.trigger_note, c.signed_on,
-       NOT EXISTS (SELECT 1 FROM contract_lines cl WHERE cl.contract_id = c.id AND cl.quantity > coalesce((
-           SELECT sum(dol.quantity) FROM delivery_order_lines dol JOIN delivery_orders d ON d.id = dol.delivery_order_id
-           WHERE dol.contract_line_id = cl.id AND d.status = 'confirmed'), 0)) AS fully_delivered,
+SELECT m.id, m.contract_id, c.number, c.customer_id, cu.name, m.seq, m.version, m.name, m.percent::text, m.amount::text, c.currency, m.trigger,
+       m.days_after, m.fixed_due_on, m.triggered_on, m.trigger_note, m.acceptance_id, c.signed_on,
+       NOT EXISTS (SELECT 1 FROM contract_lines cl WHERE cl.contract_id = c.id AND cl.quantity > line_delivered(cl.id)) AS fully_delivered,
        (SELECT d.number || ' ' || d.delivered_on::text FROM delivery_orders d WHERE d.contract_id = c.id AND d.status = 'confirmed'
         ORDER BY d.delivered_on DESC, d.number DESC LIMIT 1) AS last_delivery,
        coalesce((SELECT sum(a.amount) FROM receipt_allocations a WHERE a.milestone_id = m.id AND a.reversed_at IS NULL), 0)::text
@@ -101,8 +102,8 @@ func (h *Handlers) loadMilestones(ctx context.Context, q db.Querier, where strin
 		var fixed, triggered, signed *time.Time
 		var fullyDelivered bool
 		var lastDelivery *string
-		if err := rows.Scan(&m.ID, &m.ContractID, &number, &m.CustomerID, &m.CustomerName, &m.Seq, &m.Name, &percent, &amount, &m.Currency, &m.Trigger,
-			&m.DaysAfter, &fixed, &triggered, &m.TriggerNote, &signed, &fullyDelivered, &lastDelivery, &paid); err != nil {
+		if err := rows.Scan(&m.ID, &m.ContractID, &number, &m.CustomerID, &m.CustomerName, &m.Seq, &m.Version, &m.Name, &percent, &amount, &m.Currency, &m.Trigger,
+			&m.DaysAfter, &fixed, &triggered, &m.TriggerNote, &m.AcceptanceID, &signed, &fullyDelivered, &lastDelivery, &paid); err != nil {
 			return nil, err
 		}
 		if number != nil {
@@ -188,12 +189,36 @@ func (h *Handlers) ContractMilestones(c *gin.Context) {
 }
 
 type milestoneInput struct {
+	Version    *int64  `json:"version"`
 	Name       string  `json:"name"`
 	Percent    *string `json:"percent"`
 	Amount     string  `json:"amount"`
 	Trigger    string  `json:"trigger"`
 	DaysAfter  int     `json:"days_after"`
 	FixedDueOn *string `json:"fixed_due_on"`
+}
+
+// DraftTerm is a payment term saved atomically with a new contract draft.
+type DraftTerm = milestoneInput
+
+// CreateDraftTerms uses the same validation as manually entered terms. Amounts
+// are explicit; percentages are descriptive until the commercial basis is agreed.
+func CreateDraftTerms(ctx context.Context, tx pgx.Tx, contractID, actor uuid.UUID, terms []DraftTerm) error {
+	for i, term := range terms {
+		pct, amount, due, err := term.validate()
+		if err != nil {
+			return err
+		}
+		var id uuid.UUID
+		if err := tx.QueryRow(ctx, `INSERT INTO payment_milestones (contract_id, seq, name, percent, amount, trigger, days_after, fixed_due_on, created_by)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, contractID, i+1, term.Name, pct, amount, term.Trigger, term.DaysAfter, due, actor).Scan(&id); err != nil {
+			return err
+		}
+		if err := audit.Record(ctx, tx, "create", "payment_milestone", id, map[string]any{"name": term.Name, "amount": amount.String(), "trigger": term.Trigger}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (in *milestoneInput) validate() (*decimal.Decimal, decimal.Decimal, *time.Time, error) {
@@ -213,6 +238,9 @@ func (in *milestoneInput) validate() (*decimal.Decimal, decimal.Decimal, *time.T
 		pct = &v
 	}
 	amount := decimalx.Positive(&errs, "amount", in.Amount)
+	if amount.IsPositive() && !amount.Round(2).IsPositive() {
+		errs.Add("amount", "positive", nil)
+	}
 	switch in.Trigger {
 	case "signing", "delivery_complete", "acceptance", "date", "manual":
 	default:
@@ -315,13 +343,34 @@ func (h *Handlers) UpdateMilestone(c *gin.Context) {
 	}
 	httpx.Command(c, h.Pool, "milestones.update", false, 200, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
+		var version int64
+		var status string
+		if err := tx.QueryRow(ctx, `SELECT m.version,c.status FROM payment_milestones m JOIN contracts c ON c.id=m.contract_id WHERE m.id=$1 AND ($2::uuid IS NULL OR c.owner_id=$2) FOR UPDATE OF m`, id, scopeFor(p)).Scan(&version, &status); err != nil {
+			return nil, err
+		}
+		if status == "closed" || status == "cancelled" {
+			return nil, apperrors.Rule("contract_not_open", "This contract's terms cannot change.", nil)
+		}
+		if in.Version == nil || *in.Version != version {
+			return nil, apperrors.Conflict("version_conflict", "This payment term changed. Reload it before saving.", nil)
+		}
 		var paid string
 		if err := tx.QueryRow(ctx, `SELECT coalesce((SELECT sum(a.amount) FROM receipt_allocations a WHERE a.milestone_id = m.id AND a.reversed_at IS NULL), 0)::text
-			FROM payment_milestones m JOIN contracts c ON c.id = m.contract_id WHERE m.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2) FOR UPDATE OF m`, id, scopeFor(p)).Scan(&paid); err != nil {
+			FROM payment_milestones m JOIN contracts c ON c.id = m.contract_id WHERE m.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2)`, id, scopeFor(p)).Scan(&paid); err != nil {
 			return nil, err
 		}
 		if amount.LessThan(decimalx.MustParse(paid)) {
 			return nil, apperrors.Invalid("amount", "below_paid", map[string]any{"paid": paid})
+		}
+		var triggered bool
+		if err := tx.QueryRow(ctx, `SELECT triggered_on IS NOT NULL OR EXISTS(SELECT 1 FROM sales_invoices WHERE milestone_id=m.id) OR EXISTS(SELECT 1 FROM receipt_allocations WHERE milestone_id=m.id) FROM payment_milestones m WHERE id=$1`, id).Scan(&triggered); err != nil {
+			return nil, err
+		}
+		if triggered {
+			return nil, apperrors.Rule("milestone_in_use", "Correct linked events and money before changing this term.", nil)
+		}
+		if err := recordTermHistory(ctx, tx, id, p.UserID); err != nil {
+			return nil, err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE payment_milestones SET name = $2, percent = $3, amount = $4, trigger = $5, days_after = $6, fixed_due_on = $7,
 				triggered_on = CASE WHEN $5 IN ('acceptance', 'manual') THEN triggered_on END, version = version + 1 WHERE id = $1`,
@@ -353,8 +402,15 @@ func (h *Handlers) DeleteMilestone(c *gin.Context) {
 	}
 	httpx.Command(c, h.Pool, "milestones.delete", true, 200, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
+		var status string
+		if err := tx.QueryRow(ctx, `SELECT c.status FROM payment_milestones m JOIN contracts c ON c.id=m.contract_id WHERE m.id=$1 AND ($2::uuid IS NULL OR c.owner_id=$2) FOR UPDATE OF m`, id, scopeFor(p)).Scan(&status); err != nil {
+			return nil, err
+		}
+		if status == "closed" || status == "cancelled" {
+			return nil, apperrors.Rule("contract_not_open", "This contract's terms cannot change.", nil)
+		}
 		var used bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM receipt_allocations WHERE milestone_id = m.id) OR EXISTS (SELECT 1 FROM sales_invoices WHERE milestone_id = m.id)
+		if err := tx.QueryRow(ctx, `SELECT m.triggered_on IS NOT NULL OR EXISTS(SELECT 1 FROM payment_term_history WHERE milestone_id=m.id) OR EXISTS (SELECT 1 FROM receipt_allocations WHERE milestone_id = m.id) OR EXISTS (SELECT 1 FROM sales_invoices WHERE milestone_id = m.id)
 			FROM payment_milestones m JOIN contracts c ON c.id = m.contract_id WHERE m.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2) FOR UPDATE OF m`, id, scopeFor(p)).Scan(&used); err != nil {
 			return nil, err
 		}
@@ -403,6 +459,9 @@ func (h *Handlers) TriggerMilestone(c *gin.Context) {
 	if in.Note != nil {
 		note = strings.TrimSpace(*in.Note)
 	}
+	if note == "" {
+		errs.Add("note", "required", nil)
+	}
 	if len([]rune(note)) > 200 {
 		errs.Add("note", "too_long", map[string]any{"max": 200})
 	}
@@ -412,6 +471,13 @@ func (h *Handlers) TriggerMilestone(c *gin.Context) {
 	}
 	httpx.Command(c, h.Pool, "milestones.trigger", true, 200, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
+		var contractID uuid.UUID
+		if err := tx.QueryRow(ctx, `SELECT m.contract_id FROM payment_milestones m JOIN contracts c ON c.id=m.contract_id WHERE m.id=$1 AND c.status='active' AND ($2::uuid IS NULL OR c.owner_id=$2)`, id, scopeFor(p)).Scan(&contractID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `SELECT id FROM contract_lines WHERE contract_id=$1 ORDER BY id FOR UPDATE`, contractID); err != nil {
+			return nil, err
+		}
 		var trigger string
 		if err := tx.QueryRow(ctx, `SELECT m.trigger FROM payment_milestones m JOIN contracts c ON c.id = m.contract_id
 			WHERE m.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2) FOR UPDATE OF m`, id, scopeFor(p)).Scan(&trigger); err != nil {
@@ -419,6 +485,21 @@ func (h *Handlers) TriggerMilestone(c *gin.Context) {
 		}
 		if trigger != "acceptance" && trigger != "manual" {
 			return nil, apperrors.Rule("milestone_automatic", "This milestone starts automatically (signing, full delivery or a fixed date).", nil)
+		}
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT triggered_on IS NOT NULL FROM payment_milestones WHERE id=$1`, id).Scan(&exists); err != nil {
+			return nil, err
+		}
+		if exists {
+			return nil, apperrors.Rule("milestone_already_triggered", "Correct the existing event before recording a new one.", nil)
+		}
+		if trigger == "acceptance" {
+			// Acceptance terms fall due from acceptance documents when every line is fully
+			// accepted (owner decision 2026-11-11); there is no second, hand-entered path.
+			return nil, apperrors.Rule("acceptance_from_documents", "Record the customer's acceptance on the contract; this term falls due when every line is fully accepted.", nil)
+		}
+		if err := recordTermHistory(ctx, tx, id, p.UserID); err != nil {
+			return nil, err
 		}
 		var noteArg *string
 		if note != "" {
@@ -497,7 +578,7 @@ func (h *Handlers) Receivables(c *gin.Context) {
 		JOIN LATERAL (SELECT coalesce(sum(round(cl.quantity * cl.unit_price, 2)), 0) AS value FROM contract_lines cl WHERE cl.contract_id = c.id) v ON true
 		LEFT JOIN LATERAL (SELECT sum(a.amount) AS paid FROM receipt_allocations a JOIN payment_milestones m ON m.id = a.milestone_id
 			WHERE m.contract_id = c.id AND a.reversed_at IS NULL) p ON true
-		WHERE c.status = 'active' GROUP BY c.currency`)
+		WHERE c.status IN ('active', 'closed') GROUP BY c.currency`)
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -553,4 +634,68 @@ func (h *Handlers) Receivables(c *gin.Context) {
 		return a < b
 	})
 	response.OK(c, gin.H{"items": items, "counts": counts, "summary": summary, "as_of": time.Now()})
+}
+
+func recordTermHistory(ctx context.Context, tx pgx.Tx, id, actor uuid.UUID) error {
+	_, err := tx.Exec(ctx, `INSERT INTO payment_term_history(milestone_id,version,snapshot,changed_by) SELECT id,version,to_jsonb(m),$2 FROM payment_milestones m WHERE id=$1 ON CONFLICT DO NOTHING`, id, actor)
+	return err
+}
+
+// ResetMilestone corrects a manual event without erasing its historical date/source.
+func (h *Handlers) ResetMilestone(c *gin.Context) {
+	p := auth.Principal(c)
+	if !canEditTerms(p) {
+		response.Fail(c, apperrors.Forbidden("payment_terms"))
+		return
+	}
+	id, err := httpx.PathID(c, "id")
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	var in reverseInput
+	if err := httpx.Decode(c, &in); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	in.Reason = strings.TrimSpace(in.Reason)
+	if in.Reason == "" || len([]rune(in.Reason)) > 500 {
+		response.Fail(c, apperrors.Invalid("reason", "required", nil))
+		return
+	}
+	httpx.Command(c, h.Pool, "milestones.reset", true, 200, func(tx pgx.Tx) (any, error) {
+		ctx := c.Request.Context()
+		var cid uuid.UUID
+		if err := tx.QueryRow(ctx, `SELECT m.contract_id FROM payment_milestones m JOIN contracts c ON c.id=m.contract_id WHERE m.id=$1 AND c.status='active' AND ($2::uuid IS NULL OR c.owner_id=$2)`, id, scopeFor(p)).Scan(&cid); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `SELECT id FROM contract_lines WHERE contract_id=$1 ORDER BY id FOR UPDATE`, cid); err != nil {
+			return nil, err
+		}
+		var event bool
+		var fromAcceptance bool
+		if err := tx.QueryRow(ctx, `SELECT triggered_on IS NOT NULL, acceptance_id IS NOT NULL FROM payment_milestones WHERE id=$1 FOR UPDATE`, id).Scan(&event, &fromAcceptance); err != nil {
+			return nil, err
+		}
+		if !event {
+			return nil, apperrors.Rule("milestone_not_triggered", "There is no recorded event to correct.", nil)
+		}
+		if fromAcceptance {
+			return nil, apperrors.Rule("acceptance_from_documents", "This date comes from an acceptance document; reverse that document to correct it.", nil)
+		}
+		var dependent bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM receipt_allocations WHERE milestone_id=$1 AND reversed_at IS NULL)`, id).Scan(&dependent); err != nil {
+			return nil, err
+		}
+		if dependent {
+			return nil, apperrors.Rule("reversal_has_dependents", "Reverse allocations before correcting this event.", nil)
+		}
+		if err := recordTermHistory(ctx, tx, id, p.UserID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE payment_milestones SET triggered_on=NULL,trigger_note=NULL,version=version+1 WHERE id=$1`, id); err != nil {
+			return nil, err
+		}
+		return gin.H{"id": id, "reset": true}, audit.Record(ctx, tx, "reset_event", "payment_milestone", id, map[string]any{"reason": in.Reason})
+	})
 }

@@ -23,6 +23,8 @@ type Config struct {
 	// AnthropicAPIKey enables AI drafts (O-17); empty keeps the feature off.
 	AnthropicAPIKey string
 	AIModel         string
+	// RequireAdminMFA makes administrators turn on two-step sign-in before anything else.
+	RequireAdminMFA bool
 	// SMTP enables product-news emails to customers; empty host keeps the feature off.
 	SMTP mailer.Config
 }
@@ -54,6 +56,9 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("NAVO_COOKIE_SECURE must be true or false")
 	}
 	cfg.CookieSecure = secure
+	if cfg.RequireAdminMFA, err = strconv.ParseBool(envOr("NAVO_REQUIRE_ADMIN_MFA", "false")); err != nil {
+		return cfg, fmt.Errorf("NAVO_REQUIRE_ADMIN_MFA must be true or false")
+	}
 	for _, o := range strings.Split(os.Getenv("NAVO_ALLOWED_ORIGINS"), ",") {
 		if o = strings.TrimSpace(o); o != "" {
 			cfg.AllowedOrigins = append(cfg.AllowedOrigins, o)

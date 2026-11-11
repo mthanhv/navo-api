@@ -97,6 +97,9 @@ func (h *Handlers) CreateGoodsReceipt(c *gin.Context) {
 	}
 	var errs apperrors.FieldErrors
 	receivedOn := httpx.Date(&errs, "received_on", in.ReceivedOn)
+	if receivedOn != nil && receivedOn.After(h.today()) {
+		errs.Add("received_on", "not_future", nil)
+	}
 	if receivedOn == nil && len(errs) == 0 {
 		errs.Add("received_on", "required", nil)
 	}
@@ -132,7 +135,7 @@ func (h *Handlers) CreateGoodsReceipt(c *gin.Context) {
 		var status string
 		var contractID uuid.UUID
 		if err := tx.QueryRow(ctx, `SELECT po.status, po.contract_id FROM purchase_orders po JOIN contracts c ON c.id = po.contract_id
-			WHERE po.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2)`, poID, p.OwnerFilter()).Scan(&status, &contractID); err != nil {
+			WHERE po.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2) FOR UPDATE OF po`, poID, p.OwnerFilter()).Scan(&status, &contractID); err != nil {
 			return nil, err
 		}
 		if status != "confirmed" {
@@ -180,7 +183,7 @@ func (h *Handlers) ConfirmGoodsReceipt(c *gin.Context) {
 		if status != "draft" {
 			return nil, apperrors.Rule("document_not_draft", "Only a draft goods receipt can be confirmed.", map[string]any{"status": status})
 		}
-		rows, err := tx.Query(ctx, `SELECT pol.id, pol.contract_line_id, cl.line_no, pol.quantity::text, grl.accepted_quantity::text
+		rows, err := tx.Query(ctx, `SELECT pol.id, pol.contract_line_id, cl.line_no, (pol.quantity-pol.cancelled_quantity)::text, grl.accepted_quantity::text
 			FROM purchase_order_lines pol JOIN goods_receipt_lines grl ON grl.purchase_order_line_id = pol.id AND grl.goods_receipt_id = $1
 			JOIN contract_lines cl ON cl.id = pol.contract_line_id
 			ORDER BY pol.id FOR UPDATE OF pol`, id)
@@ -211,8 +214,7 @@ func (h *Handlers) ConfirmGoodsReceipt(c *gin.Context) {
 		for _, ch := range checks {
 			lineIDs = append(lineIDs, ch.contractLine)
 			var already string
-			if err := tx.QueryRow(ctx, `SELECT coalesce(sum(grl.accepted_quantity), 0)::text FROM goods_receipt_lines grl
-				JOIN goods_receipts gr ON gr.id = grl.goods_receipt_id WHERE grl.purchase_order_line_id = $1 AND gr.status = 'confirmed'`, ch.poLine).Scan(&already); err != nil {
+			if err := tx.QueryRow(ctx, `SELECT po_line_received($1)::text`, ch.poLine).Scan(&already); err != nil {
 				return nil, err
 			}
 			if decimalx.MustParse(already).Add(ch.accepted).GreaterThan(ch.ordered) {
@@ -403,6 +405,9 @@ func (h *Handlers) ConfirmDeliveryOrder(c *gin.Context) {
 	}
 	var errs apperrors.FieldErrors
 	delivered := httpx.Date(&errs, "delivered_on", in.DeliveredOn)
+	if delivered != nil && delivered.After(h.today()) {
+		errs.Add("delivered_on", "not_future", nil)
+	}
 	if delivered == nil && len(errs) == 0 {
 		errs.Add("delivered_on", "required", nil)
 	}
@@ -446,12 +451,7 @@ func confirmDOTx(ctx context.Context, tx pgx.Tx, id uuid.UUID, deliveredOn time.
 	for i, ch := range checks {
 		lineIDs[i] = ch.lineID
 		var deliveredSoFar, received string
-		if err := tx.QueryRow(ctx, `SELECT
-				coalesce((SELECT sum(dol.quantity) FROM delivery_order_lines dol JOIN delivery_orders d ON d.id = dol.delivery_order_id
-				          WHERE dol.contract_line_id = $1 AND d.status = 'confirmed'), 0)::text,
-				coalesce((SELECT sum(grl.accepted_quantity) FROM goods_receipt_lines grl JOIN goods_receipts gr ON gr.id = grl.goods_receipt_id
-				          JOIN purchase_order_lines pol ON pol.id = grl.purchase_order_line_id
-				          WHERE pol.contract_line_id = $1 AND gr.status = 'confirmed'), 0)::text`, ch.lineID).Scan(&deliveredSoFar, &received); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT line_delivered($1)::text, line_received($1)::text`, ch.lineID).Scan(&deliveredSoFar, &received); err != nil {
 			return err
 		}
 		done, in := decimalx.MustParse(deliveredSoFar), decimalx.MustParse(received)

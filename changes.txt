@@ -1,0 +1,6 @@
+2026-11-11 — Product reliability remediation
+- Add migrations 011–014 for authorization-bound replay, frozen MISA batches, linked reversals, payment allocations, term history, extraction jobs/attempts and selected handovers.
+- Serialize receipt/payment limits after separate locks; validate supplier/currency; expose explicit advance allocation and reversal. Do not invent split sales-invoice settlement.
+- Add scoped/audited task writes, file mutation gates and upload identities; safe ZIP preparation; atomic contract terms/draft edits; evidenced once-only full-delivery acceptance and correction history.
+- Preserve original full documents on reversal; cancel unreceived PO balances only. Harden notes, AI result recovery/quotas, SMTP uncertainty and migration readiness.
+- Validation: make check; race integration suite plus deterministic finance/security/correction/handover/note regressions; local fake-provider recovery/quota test. See docs/REMEDIATION.md for exact limits and release work.

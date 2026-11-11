@@ -59,6 +59,9 @@ func Decode(c *gin.Context, dst any) error {
 		}
 		return apperrors.Invalid("body", "invalid_json", map[string]any{"detail": err.Error()})
 	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		return apperrors.Invalid("body", "invalid_json", nil)
+	}
 	return nil
 }
 
@@ -69,9 +72,10 @@ func Page(c *gin.Context) (page, size int) {
 	if page < 1 {
 		page = 1
 	}
-	if size < 1 || size > 100 {
+	if size < 1 {
 		size = 25
 	}
+	size = min(size, 100)
 	return page, size
 }
 
@@ -125,6 +129,9 @@ func Command(c *gin.Context, pool *pgxpool.Pool, scope string, idempotent bool, 
 		response.Fail(c, apperrors.Invalid(idempotency.Header, "required", nil))
 		return
 	}
+	// Create endpoints also honor a supplied key while remaining compatible
+	// with older clients which did not send one for drafts.
+	idempotent = idempotent || key != ""
 	var result any
 	var replay *idempotency.Stored
 	actor := reqctx.Actor(ctx)

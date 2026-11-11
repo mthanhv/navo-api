@@ -171,8 +171,7 @@ func (h *Handlers) ReportOverview(c *gin.Context) {
 			(SELECT count(DISTINCT po.id) FROM purchase_orders po JOIN contracts c ON c.id = po.contract_id
 			 JOIN purchase_order_lines pol ON pol.purchase_order_id = po.id
 			 WHERE po.status = 'confirmed' AND ($1::uuid IS NULL OR c.owner_id = $1)
-			   AND pol.quantity > coalesce((SELECT sum(grl.accepted_quantity) FROM goods_receipt_lines grl
-			       JOIN goods_receipts gr ON gr.id = grl.goods_receipt_id WHERE grl.purchase_order_line_id = pol.id AND gr.status = 'confirmed'), 0))`,
+			   AND (pol.quantity-pol.cancelled_quantity) > po_line_received(pol.id))`,
 		owner).Scan(&o.ActiveContracts, &o.POsAwaitingGoods); err != nil {
 		response.Fail(c, err)
 		return
@@ -239,6 +238,11 @@ type Documents struct {
 	PurchaseOrders []*PurchaseOrder `json:"purchase_orders"`
 	GoodsReceipts  []*GoodsReceipt  `json:"goods_receipts"`
 	DeliveryOrders []*DeliveryOrder `json:"delivery_orders"`
+	// After activation: signed amendments, acceptances and returns (all kept, reversed ones marked).
+	Amendments      []*Amendment `json:"amendments"`
+	Acceptances     []*EventDoc  `json:"acceptances"`
+	CustomerReturns []*EventDoc  `json:"customer_returns"`
+	SupplierReturns []*EventDoc  `json:"supplier_returns"`
 }
 
 // ContractDocuments handles GET /contracts/:id/documents.
@@ -270,7 +274,8 @@ func (h *Handlers) ContractDocuments(c *gin.Context) {
 		}
 		return out, rows.Err()
 	}
-	docs := Documents{PurchaseOrders: []*PurchaseOrder{}, GoodsReceipts: []*GoodsReceipt{}, DeliveryOrders: []*DeliveryOrder{}}
+	docs := Documents{PurchaseOrders: []*PurchaseOrder{}, GoodsReceipts: []*GoodsReceipt{}, DeliveryOrders: []*DeliveryOrder{},
+		Amendments: []*Amendment{}, Acceptances: []*EventDoc{}, CustomerReturns: []*EventDoc{}, SupplierReturns: []*EventDoc{}}
 	poIDs, err := ids(`SELECT id FROM purchase_orders WHERE contract_id = $1 ORDER BY number`)
 	if err == nil {
 		for _, x := range poIDs {
@@ -307,6 +312,9 @@ func (h *Handlers) ContractDocuments(c *gin.Context) {
 				docs.DeliveryOrders = append(docs.DeliveryOrders, d)
 			}
 		}
+	}
+	if err == nil {
+		err = lifecycleDocs(ctx, h.Pool, id, &docs)
 	}
 	if err != nil {
 		response.Fail(c, err)

@@ -2,12 +2,14 @@ package documents
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -145,9 +147,18 @@ func ext(name string) string {
 func (h *Handlers) Upload(c *gin.Context) {
 	ctx := c.Request.Context()
 	p := auth.Principal(c)
+	if !canWriteFiles(p) {
+		response.Fail(c, apperrors.Forbidden("files.write"))
+		return
+	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxUpload+1<<20)
 	ownerType, docKind := c.PostForm("owner_type"), c.PostForm("doc_kind")
 	var errs apperrors.FieldErrors
+	var clientID *uuid.UUID
+	if raw := c.PostForm("client_id"); raw != "" {
+		v := httpx.UUID(&errs, "client_id", raw)
+		clientID = &v
+	}
 	ownerID := httpx.UUID(&errs, "owner_id", c.PostForm("owner_id"))
 	if !allowed(ownerType, docKind) {
 		errs.Add("doc_kind", "one_of", map[string]any{"values": KindsFor(ownerType)})
@@ -205,13 +216,35 @@ func (h *Handlers) Upload(c *gin.Context) {
 	}
 	name := strings.TrimSpace(filepath.Base(fh.Filename))
 	var item FileItem
+	replayed := false
 	err = db.InTx(ctx, h.Pool, func(tx pgx.Tx) error {
+		if clientID != nil {
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, p.UserID.String()+clientID.String()); err != nil {
+				return err
+			}
+			var oldOwner uuid.UUID
+			var oldType, oldKind, oldName string
+			var oldSum []byte
+			err := tx.QueryRow(ctx, `SELECT l.id, l.file_id, l.owner_id, l.owner_type, l.doc_kind, f.original_name, f.sha256, l.created_at
+				FROM attachment_links l JOIN files f ON f.id = l.file_id WHERE l.created_by = $1 AND l.client_id = $2`, p.UserID, *clientID).
+				Scan(&item.LinkID, &item.FileID, &oldOwner, &oldType, &oldKind, &oldName, &oldSum, &item.UploadedAt)
+			if err == nil {
+				if oldOwner != ownerID || oldType != ownerType || oldKind != docKind || oldName != name || !bytes.Equal(oldSum, sum) {
+					return apperrors.Conflict("idempotency_payload_mismatch", "This upload identity belongs to another file.", nil)
+				}
+				replayed = true
+				return nil
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO files (id, original_name, content_type, size_bytes, sha256, uploaded_by) VALUES ($1, $2, $3, $4, $5, $6)`,
 			fileID, name, ctype, size, sum, p.UserID); err != nil {
 			return err
 		}
-		if err := tx.QueryRow(ctx, `INSERT INTO attachment_links (file_id, owner_type, owner_id, customer_id, contract_id, doc_kind, created_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, created_at`, fileID, ownerType, ownerID, o.CustomerID, o.ContractID, docKind, p.UserID).
+		if err := tx.QueryRow(ctx, `INSERT INTO attachment_links (file_id, owner_type, owner_id, customer_id, contract_id, doc_kind, created_by, client_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, created_at`, fileID, ownerType, ownerID, o.CustomerID, o.ContractID, docKind, p.UserID, clientID).
 			Scan(&item.LinkID, &item.UploadedAt); err != nil {
 			return err
 		}
@@ -222,7 +255,13 @@ func (h *Handlers) Upload(c *gin.Context) {
 		response.Fail(c, err)
 		return
 	}
-	item.FileID, item.Name, item.Ext, item.Kind, item.Size = fileID, name, ext(name), docKind, size
+	if replayed {
+		h.Store.Remove(fileID)
+		c.Header("Idempotent-Replayed", "true")
+	} else {
+		item.FileID = fileID
+	}
+	item.Name, item.Ext, item.Kind, item.Size = name, ext(name), docKind, size
 	item.UploadedBy, item.OwnerType, item.OwnerID, item.SharedWith, item.CanRemove = p.Name, ownerType, ownerID, []string{}, true
 	c.JSON(http.StatusCreated, gin.H{"request_id": c.GetString("request_id"), "status": http.StatusCreated, "success": true, "data": item})
 }
@@ -301,7 +340,7 @@ func (h *Handlers) visibleLinks(ctx context.Context, p *access.Principal, where 
 			continue
 		}
 		l.SharedWith = numbersOf(ctx, h.Pool, shared[l.LinkID])
-		l.CanRemove = l.CreatedBy == p.UserID || p.Can(access.ContractsWrite)
+		l.CanRemove = canWriteFiles(p) && (l.CreatedBy == p.UserID || p.Can(access.ContractsWrite))
 		out = append(out, l.FileItem)
 	}
 	return out, nil
@@ -403,6 +442,10 @@ func safeName(s string) string {
 // bytes stay (other links and backups may still need them).
 func (h *Handlers) Unlink(c *gin.Context) {
 	p := auth.Principal(c)
+	if !canWriteFiles(p) {
+		response.Fail(c, apperrors.Forbidden("files.write"))
+		return
+	}
 	id, err := httpx.PathID(c, "id")
 	if err != nil {
 		response.Fail(c, err)
@@ -467,30 +510,65 @@ func (h *Handlers) Zip(c *gin.Context) {
 			}
 		}
 	}
-	c.Header("Content-Type", "application/zip")
-	c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": safeName(cd.CustomerCode+"_"+cd.Number) + ".zip"}))
-	c.Header("Cache-Control", "private, no-store")
-	c.Status(http.StatusOK)
-	zw := zip.NewWriter(c.Writer)
+	var total int64
+	for _, e := range entries {
+		total += e.item.Size
+	}
+	if total > 500<<20 {
+		response.Fail(c, apperrors.Rule("archive_too_large", "Download individual documents; this archive exceeds 500 MB.", nil))
+		return
+	}
+	tmp, err := os.CreateTemp("", "navo-documents-*.zip")
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	zw := zip.NewWriter(tmp)
 	used := map[string]int{}
 	for _, e := range entries {
 		base := strings.TrimSuffix(safeName(e.item.Name), ".")
 		name := path.Join(e.folder, base)
-		if n := used[name]; n > 0 {
+		for n := 2; used[name] > 0; n++ {
 			ext := path.Ext(base)
-			name = path.Join(e.folder, fmt.Sprintf("%s (%d)%s", strings.TrimSuffix(base, ext), n+1, ext))
+			name = path.Join(e.folder, fmt.Sprintf("%s (%d)%s", strings.TrimSuffix(base, ext), n, ext))
 		}
-		used[path.Join(e.folder, base)]++
+		used[name]++
 		w, err := zw.CreateHeader(&zip.FileHeader{Name: name, Method: zip.Deflate, Modified: e.item.UploadedAt})
 		if err != nil {
-			break
+			_ = zw.Close()
+			response.Fail(c, err)
+			return
 		}
 		f, err := h.Store.Open(e.item.FileID)
 		if err != nil {
-			continue
+			_ = zw.Close()
+			response.Fail(c, err)
+			return
 		}
-		_, _ = io.Copy(w, f)
+		_, err = io.Copy(w, f)
 		f.Close()
+		if err != nil {
+			_ = zw.Close()
+			response.Fail(c, err)
+			return
+		}
 	}
-	_ = zw.Close()
+	if err := zw.Close(); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	stat, err := tmp.Stat()
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": safeName(cd.CustomerCode+"_"+cd.Number) + ".zip"}))
+	c.Header("Cache-Control", "private, no-store")
+	c.DataFromReader(200, stat.Size(), "application/zip", tmp, nil)
 }

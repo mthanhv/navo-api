@@ -42,13 +42,34 @@ func run() error {
 	}
 	defer pool.Close()
 
+	// Housekeeping: once at start and then daily, drop long-finished sessions and old
+	// command results so those tables do not grow for ever.
+	go func() {
+		tick := time.NewTicker(24 * time.Hour)
+		defer tick.Stop()
+		for {
+			if sessions, results, err := db.Purge(ctx, pool); err != nil {
+				slog.Warn("housekeeping failed", "error", err)
+			} else if sessions+results > 0 {
+				slog.Info("housekeeping", "sessions_deleted", sessions, "command_results_deleted", results)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
+		}
+	}()
+
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           router.New(cfg, pool),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		// Synchronous extraction is bounded to 180s. Its result must still fit
+		// within the API, client (240s), and edge (300s) response budgets.
+		WriteTimeout: 230 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 	errCh := make(chan error, 1)
 	go func() {

@@ -71,6 +71,9 @@ func (h *Handlers) requestOverride(c *gin.Context, kind string) {
 		errs.Add("reason", "too_long", map[string]any{"max": 1000})
 	}
 	delivered := httpx.Date(&errs, "delivered_on", in.DeliveredOn)
+	if delivered != nil && delivered.After(h.today()) {
+		errs.Add("delivered_on", "not_future", nil)
+	}
 	if kind == "delivery_order" && delivered == nil && len(errs) == 0 {
 		errs.Add("delivered_on", "required", nil)
 	}
@@ -128,6 +131,7 @@ type OverrideRequest struct {
 	DeliveredOn    *string        `json:"delivered_on"`
 	Status         string         `json:"status"`
 	RequestedBy    string         `json:"requested_by"`
+	RequestedByID  uuid.UUID      `json:"requested_by_id"`
 	RequestedAt    time.Time      `json:"requested_at"`
 	DecisionNote   *string        `json:"decision_note"`
 	DecidedBy      *string        `json:"decided_by"`
@@ -135,7 +139,7 @@ type OverrideRequest struct {
 }
 
 const overrideSelect = `SELECT r.id, r.kind, r.document_id, coalesce(po.number, d.number), r.contract_id, c.number, o.name, r.reason, r.delivered_on,
-		r.status, ru.full_name, r.requested_at, r.decision_note, du.full_name
+		r.status, ru.full_name, r.requested_by, r.requested_at, r.decision_note, du.full_name
 	FROM quantity_override_requests r
 	JOIN contracts c ON c.id = r.contract_id JOIN organizations o ON o.id = c.customer_id JOIN users ru ON ru.id = r.requested_by
 	LEFT JOIN users du ON du.id = r.decided_by
@@ -146,18 +150,17 @@ func scanOverride(ctx context.Context, q db.Querier, row pgx.Row) (*OverrideRequ
 	var r OverrideRequest
 	var delivered *time.Time
 	if err := row.Scan(&r.ID, &r.Kind, &r.DocumentID, &r.DocumentNumber, &r.ContractID, &r.ContractNumber, &r.CustomerName, &r.Reason, &delivered,
-		&r.Status, &r.RequestedBy, &r.RequestedAt, &r.DecisionNote, &r.DecidedBy); err != nil {
+		&r.Status, &r.RequestedBy, &r.RequestedByID, &r.RequestedAt, &r.DecisionNote, &r.DecidedBy); err != nil {
 		return nil, err
 	}
 	r.DeliveredOn = dateString(delivered)
 	lineSQL := map[string]string{
 		"purchase_order": `SELECT cl.line_no, cl.name_on_contract, cl.unit, cl.quantity::text, pol.quantity::text,
-				coalesce((SELECT sum(x.quantity) FROM purchase_order_lines x JOIN purchase_orders xp ON xp.id = x.purchase_order_id
+				coalesce((SELECT sum(x.quantity-x.cancelled_quantity) FROM purchase_order_lines x JOIN purchase_orders xp ON xp.id = x.purchase_order_id
 				          WHERE x.contract_line_id = cl.id AND xp.status = 'confirmed'), 0)::text
 			FROM purchase_order_lines pol JOIN contract_lines cl ON cl.id = pol.contract_line_id WHERE pol.purchase_order_id = $1 ORDER BY cl.line_no`,
 		"delivery_order": `SELECT cl.line_no, cl.name_on_contract, cl.unit, cl.quantity::text, dol.quantity::text,
-				coalesce((SELECT sum(x.quantity) FROM delivery_order_lines x JOIN delivery_orders xd ON xd.id = x.delivery_order_id
-				          WHERE x.contract_line_id = cl.id AND xd.status = 'confirmed'), 0)::text
+				line_delivered(cl.id)::text
 			FROM delivery_order_lines dol JOIN contract_lines cl ON cl.id = dol.contract_line_id WHERE dol.delivery_order_id = $1 ORDER BY cl.line_no`,
 	}[r.Kind]
 	rows, err := q.Query(ctx, lineSQL, r.DocumentID)
@@ -249,14 +252,19 @@ func (h *Handlers) decide(c *gin.Context, approve bool) {
 	httpx.Command(c, h.Pool, scope, true, 200, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
 		var kind, status string
-		var docID uuid.UUID
+		var docID, requester uuid.UUID
 		var delivered *time.Time
-		if err := tx.QueryRow(ctx, `SELECT kind, document_id, status, delivered_on FROM quantity_override_requests WHERE id = $1 FOR UPDATE`, id).
-			Scan(&kind, &docID, &status, &delivered); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT kind, document_id, status, delivered_on, requested_by FROM quantity_override_requests WHERE id = $1 FOR UPDATE`, id).
+			Scan(&kind, &docID, &status, &delivered, &requester); err != nil {
 			return nil, err
 		}
 		if status != "pending" {
 			return nil, apperrors.Rule("override_already_decided", "This request has already been decided.", map[string]any{"status": status})
+		}
+		// BR-05 is a four-eyes control: whoever asked for the excess cannot also allow it
+		// (owner decision 2026-11-11, needed once Admin also holds the write permissions).
+		if requester == p.UserID {
+			return nil, apperrors.Rule("override_self_decision", "Another approver must decide your own request.", nil)
 		}
 		newStatus := "rejected"
 		if approve {

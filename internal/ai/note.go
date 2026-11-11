@@ -80,7 +80,7 @@ func (h *Handlers) NoteParse(c *gin.Context) {
 		response.Fail(c, apperrors.Invalid("text", "required", nil))
 		return
 	}
-	n, err := h.AI.ParseNote(c.Request.Context(), in.Text, time.Now().In(h.TZ))
+	n, err := h.noteCached(c.Request.Context(), in.Text, time.Now().In(h.TZ))
 	if err != nil {
 		response.Fail(c, err)
 		return
