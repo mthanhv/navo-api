@@ -3,7 +3,7 @@ include .env
 export
 endif
 
-.PHONY: run build test test-integration check migrate user seed
+.PHONY: run build test test-integration check migrate user seed clear-transaction-data
 
 run:
 	go run ./cmd/api
@@ -21,7 +21,7 @@ test-integration:
 ifndef TEST_DATABASE_URL
 	$(error TEST_DATABASE_URL is not set)
 endif
-	go test -tags=integration -race -count=1 ./...
+	go test -tags=integration -race -count=1 -timeout=20m ./...
 
 check:
 	@test -z "$$(gofmt -l .)" || (gofmt -l . && echo "run gofmt -w ." && exit 1)
@@ -38,6 +38,10 @@ endif
 # Empty *dev*/*demo* database only: NAVO_SEED_PASSWORD=... make seed
 seed:
 	go run ./cmd/navo-seed
+
+# Dry run by default. To delete, pass ARGS="--execute --confirm-db navo_dev".
+clear-transaction-data:
+	./scripts/clear-transactional-data.sh $(ARGS)
 
 # NAVO_USER_PASSWORD=... make user EMAIL=admin@congty.vn NAME="Quản trị" ROLES=admin
 user:

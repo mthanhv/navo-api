@@ -102,7 +102,7 @@ func (h *Handlers) ListDeliveryOrders(c *gin.Context) {
 	p := auth.Principal(c)
 	page, size := httpx.Page(c)
 	delivered := c.DefaultQuery("view", "planned") == "delivered"
-	order := `d.planned_on NULLS LAST, d.number`
+	order := `d.planned_on NULLS FIRST, d.created_at DESC, d.number DESC`
 	if delivered {
 		order = `d.delivered_on DESC, d.number DESC`
 	}

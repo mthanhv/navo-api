@@ -29,7 +29,7 @@ func TestAcceptanceTermsAfterCommercialChanges(t *testing.T) {
 	f := e.activeContract(actor, "SYNC", "10")
 	e.receiveAndDeliver(actor, f, "sync", "10", "10")
 	term := func(name, trigger string) map[string]any {
-		return e.must(201, e.do(actor, "POST", "/api/v1/contracts/"+f.contract+"/milestones", map[string]any{"name": name, "trigger": trigger, "amount": "10", "days_after": 0}, nil), "term")
+		return e.must(201, e.do(actor, "POST", "/api/v1/contracts/"+f.contract+"/milestones", map[string]any{"name": name, "trigger": trigger, "amount": "3", "days_after": 0}, nil), "term")
 	}
 	first := term("Acceptance", "acceptance")
 	e.must(201, e.do(actor, "POST", "/api/v1/contracts/"+f.contract+"/acceptances", map[string]any{"on": "2026-10-06", "evidence": "Signed", "lines": []any{map[string]any{"contract_line_id": f.line, "quantity": "10"}}}, key("sync-accept")), "accept")
@@ -40,7 +40,7 @@ func TestAcceptanceTermsAfterCommercialChanges(t *testing.T) {
 		t.Fatalf("new acceptance term did not inherit event: %v", m)
 	}
 	manual := term("Change to acceptance", "manual")
-	e.must(200, e.do(actor, "PATCH", "/api/v1/milestones/"+manual["id"].(string), map[string]any{"version": manual["version"], "name": "Changed", "trigger": "acceptance", "amount": "10", "days_after": 0}, nil), "change trigger")
+	e.must(200, e.do(actor, "PATCH", "/api/v1/milestones/"+manual["id"].(string), map[string]any{"version": manual["version"], "name": "Changed", "trigger": "acceptance", "amount": "3", "days_after": 0}, nil), "change trigger")
 	for _, v := range terms() {
 		if v.(map[string]any)["triggered_on"] != "2026-10-06" {
 			t.Fatalf("term missing event: %v", v)

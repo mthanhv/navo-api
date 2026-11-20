@@ -143,6 +143,7 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	a.POST("/goods-receipts/:id/reverse", need(access.FulfillmentConfirm), co.ReverseFulfillment("goods_receipt"))
 
 	a.POST("/contracts/:id/delivery-orders", need(access.FulfillmentWrite), co.CreateDeliveryOrder)
+	a.PATCH("/delivery-orders/:id", need(access.FulfillmentWrite), co.UpdateDeliveryOrder)
 	a.POST("/delivery-orders/:id/confirm", need(access.FulfillmentConfirm), co.ConfirmDeliveryOrder)
 	a.POST("/delivery-orders/:id/cancel", need(access.FulfillmentWrite), co.CancelDeliveryOrder)
 	a.POST("/delivery-orders/:id/reverse", need(access.FulfillmentConfirm), co.ReverseFulfillment("delivery_order"))

@@ -269,6 +269,9 @@ func (s *Service) queueApprovals(ctx context.Context) error {
 		list = append(list, x)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	for _, x := range list {
 		body := fmt.Sprintf("⚠️ Đề nghị vượt số lượng chờ duyệt\n%s (%s) · %s\nLý do: %s%s", x.doc, deref(x.contract), x.who, x.reason, s.link("/approvals"))
 		if r.toPeople {
@@ -369,6 +372,9 @@ func (s *Service) queueDaily(ctx context.Context, today time.Time) error {
 				people = append(people, p)
 			}
 			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
 			for _, p := range people {
 				mine := []core.LineRow{}
 				for _, l := range need {
@@ -415,6 +421,9 @@ func (s *Service) queueDaily(ctx context.Context, today time.Time) error {
 			list = append(list, d)
 		}
 		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
 		if len(list) > 0 {
 			text := func(ds []delivery) string {
 				var b strings.Builder
@@ -452,6 +461,9 @@ func (s *Service) queueDaily(ctx context.Context, today time.Time) error {
 					people = append(people, p)
 				}
 				rows.Close()
+				if err := rows.Err(); err != nil {
+					return err
+				}
 				for _, p := range people {
 					mine := []delivery{}
 					for _, d := range list {
@@ -497,6 +509,9 @@ func (s *Service) queueDaily(ctx context.Context, today time.Time) error {
 			list = append(list, q)
 		}
 		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
 		for _, q := range list {
 			body := fmt.Sprintf("⏳ Báo giá %s sắp hết hiệu lực (%s)\n%s · %s\nGọi khách chốt hoặc gia hạn báo giá.%s", q.number, q.until.Format("02/01"), q.customer, q.title, s.link("/quotations"))
 			if r.toPeople && q.chat != nil {
@@ -580,6 +595,9 @@ func (s *Service) sendPending(ctx context.Context, token string) error {
 		list = append(list, m)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	for _, m := range list {
 		// Recheck after loading the batch too: an offboarding/handover can invalidate
 		// messages while another network send in this batch is in flight.

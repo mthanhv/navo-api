@@ -22,12 +22,14 @@ type Plan struct {
 // Ordered counts confirmed POs, Received accepted goods of confirmed receipts,
 // Delivered confirmed delivery orders.
 type Facts struct {
-	Contract       decimal.Decimal
-	Ordered        decimal.Decimal
-	Received       decimal.Decimal
-	Delivered      decimal.Decimal
-	DueOn          *time.Time
-	NextPlan       *Plan
+	Contract  decimal.Decimal
+	Ordered   decimal.Decimal
+	Received  decimal.Decimal
+	Delivered decimal.Decimal
+	DueOn     *time.Time
+	NextPlan  *Plan
+	// Planned is the quantity on every open plan (draft deliveries, dated or not).
+	Planned        decimal.Decimal
 	ReceiptOverdue bool
 }
 
@@ -53,6 +55,15 @@ type Flag struct {
 // Remaining is max(contract - delivered, 0); an excess is reported by Over, never hidden.
 func Remaining(f Facts) decimal.Decimal {
 	return decimal.Max(f.Contract.Sub(f.Delivered), decimal.Zero)
+}
+
+// Unplanned is what is still to deliver and on no plan: max(remaining - planned, 0).
+func Unplanned(f Facts) decimal.Decimal {
+	planned := f.Planned
+	if f.NextPlan != nil {
+		planned = decimal.Max(planned, f.NextPlan.Quantity) // the next plan is part of what is planned
+	}
+	return decimal.Max(Remaining(f).Sub(planned), decimal.Zero)
 }
 
 // Over is the quantity delivered beyond the contract, or zero.
@@ -90,8 +101,9 @@ func Flags(f Facts, today time.Time, horizonDays int) []Flag {
 	if over := Over(f); over.IsPositive() {
 		add("over_delivered", Critical, map[string]string{"over": over.String()})
 	}
-	if open && f.NextPlan == nil {
-		add("no_plan", Warning, map[string]string{"remaining": remaining.String(), "available": Available(f).String()})
+	// "No plan" covers the part without a plan: planning 6 of 10 still leaves 4 to plan.
+	if unplanned := Unplanned(f); open && unplanned.IsPositive() {
+		add("no_plan", Warning, map[string]string{"remaining": unplanned.String(), "available": Available(f).String()})
 	}
 	if f.NextPlan != nil && !f.NextPlan.On.After(today.AddDate(0, 0, horizonDays)) && f.NextPlan.Quantity.GreaterThan(Available(f)) {
 		add("stock_short", Warning, map[string]string{

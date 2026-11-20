@@ -1,6 +1,7 @@
 package finance
 
 import (
+	"context"
 	"strings"
 	"time"
 
@@ -65,9 +66,12 @@ func (in *amountsInput) parse(errs *apperrors.FieldErrors, today time.Time) (*ti
 	} else if on.After(today) {
 		errs.Add("issued_on", "not_future", nil)
 	}
-	net := decimalx.NonNegative(errs, "amount_net", in.AmountNet).Round(2)
-	vat := decimalx.NonNegative(errs, "vat_amount", in.VATAmount).Round(2)
-	return on, net, vat, currency(errs, in.Currency)
+	net := decimalx.NonNegative(errs, "amount_net", in.AmountNet)
+	vat := decimalx.NonNegative(errs, "vat_amount", in.VATAmount)
+	cur := currency(errs, in.Currency)
+	decimalx.CheckMoney(errs, "amount_net", net, cur)
+	decimalx.CheckMoney(errs, "vat_amount", vat, cur)
+	return on, net.Round(2), vat.Round(2), cur
 }
 
 type salesInvoiceInput struct {
@@ -123,6 +127,9 @@ func (h *Handlers) CreateSalesInvoice(c *gin.Context) {
 			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM payment_milestones WHERE id = $1 AND contract_id = $2)`, *milestone, id).Scan(&ok); err != nil || !ok {
 				return nil, apperrors.Invalid("milestone_id", "not_in_contract", nil)
 			}
+		}
+		if err := checkLegalNumber(ctx, tx, "sales_invoices", nil, in.LegalNumber); err != nil {
+			return nil, err
 		}
 		number, err := numbering.NextChild(ctx, tx, id, "SI")
 		if err != nil {
@@ -185,6 +192,9 @@ func (h *Handlers) CreatePurchaseInvoice(c *gin.Context) {
 			if n != len(pos) {
 				return nil, apperrors.Invalid("purchase_order_ids", "other_supplier", nil)
 			}
+		}
+		if err := checkLegalNumber(ctx, tx, "purchase_invoices", &supplier, in.LegalNumber); err != nil {
+			return nil, err
 		}
 		seq, err := numbering.NextYearly(ctx, tx, "PI", on.Year()%100)
 		if err != nil {
@@ -417,8 +427,10 @@ func (h *Handlers) CreatePayment(c *gin.Context) {
 	} else if on.After(h.today()) {
 		errs.Add("paid_on", "not_future", nil)
 	}
-	amount := decimalx.Positive(&errs, "amount", in.Amount).Round(2)
+	amount := decimalx.Positive(&errs, "amount", in.Amount)
 	cur := currency(&errs, in.Currency)
+	decimalx.CheckMoney(&errs, "amount", amount, cur)
+	amount = amount.Round(2)
 	if in.Method != "bank" && in.Method != "cash" {
 		errs.Add("method", "one_of", map[string]any{"values": []string{"bank", "cash"}})
 	}
@@ -498,4 +510,36 @@ func (h *Handlers) ListPayments(c *gin.Context) {
 		return
 	}
 	response.OK(c, items)
+}
+
+// legalKey is how legal e-invoice numbers are compared: case and spaces do not make a different
+// invoice ("1c26tnd0000123" is "1C26TND 0000123").
+const legalKeySQL = `upper(regexp_replace(legal_number, '\s', '', 'g'))`
+
+func legalKey(n string) string {
+	return strings.ToUpper(strings.Join(strings.Fields(n), ""))
+}
+
+// checkLegalNumber refuses a legal number already used by an issued invoice (for purchase
+// invoices: of the same supplier). It runs before a document number is taken, and the advisory
+// lock makes two simultaneous saves of the same number queue instead of both passing.
+func checkLegalNumber(ctx context.Context, tx pgx.Tx, table string, supplier *uuid.UUID, legal string) error {
+	key := legalKey(legal)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, table+":"+key); err != nil {
+		return err
+	}
+	var taken bool
+	q := `SELECT EXISTS (SELECT 1 FROM sales_invoices WHERE status = 'issued' AND ` + legalKeySQL + ` = $1)`
+	args := []any{key}
+	if table == "purchase_invoices" {
+		q = `SELECT EXISTS (SELECT 1 FROM purchase_invoices WHERE supplier_id = $2 AND ` + legalKeySQL + ` = $1)`
+		args = append(args, *supplier)
+	}
+	if err := tx.QueryRow(ctx, q, args...).Scan(&taken); err != nil {
+		return err
+	}
+	if taken {
+		return apperrors.Invalid("legal_number", "taken", nil)
+	}
+	return nil
 }

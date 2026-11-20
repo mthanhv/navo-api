@@ -125,8 +125,8 @@ func (h *Handlers) ListLeads(c *gin.Context) {
 	q := strings.TrimSpace(c.Query("q"))
 	stale := c.Query("stale") == "1"
 	rows, err := h.Pool.Query(c.Request.Context(), leadSelect+` WHERE `+leadScope+` AND ($2::uuid IS NULL OR o.owner_id = $2)
-		AND ($3 = '' OR o.name ILIKE '%'||$3||'%' OR o.code ILIKE '%'||$3||'%' OR o.industry ILIKE '%'||$3||'%'
-		     OR EXISTS (SELECT 1 FROM contacts ct WHERE ct.organization_id = o.id AND (ct.full_name ILIKE '%'||$3||'%' OR ct.phone ILIKE '%'||$3||'%')))
+		AND ($3 = '' OR strpos(vn_fold(o.name), vn_fold($3)) > 0 OR strpos(vn_fold(o.code), vn_fold($3)) > 0 OR strpos(vn_fold(o.industry), vn_fold($3)) > 0
+		     OR EXISTS (SELECT 1 FROM contacts ct WHERE ct.organization_id = o.id AND (strpos(vn_fold(ct.full_name), vn_fold($3)) > 0 OR strpos(vn_fold(ct.phone), vn_fold($3)) > 0)))
 		ORDER BY coalesce(na.planned_on, '9999-12-31'), coalesce(la.done_at, o.lead_since) DESC, o.name, o.id`, p.OwnerFilter(), owner, q)
 	if err != nil {
 		response.Fail(c, err)
@@ -601,7 +601,7 @@ func (h *Handlers) Owners(c *gin.Context) {
 	p := auth.Principal(c)
 	rows, err := h.Pool.Query(c.Request.Context(), `SELECT u.id, u.full_name FROM users u WHERE u.is_active
 		AND EXISTS(SELECT 1 FROM user_roles r WHERE r.user_id = u.id AND r.role IN ('sales','sales_manager','admin'))
-		AND ($1::uuid IS NULL OR u.id = $1) ORDER BY u.full_name, u.id`, p.OwnerFilter())
+		AND ($1::uuid IS NULL OR u.id = $1) ORDER BY vn_fold(u.full_name), u.full_name, u.id`, p.OwnerFilter())
 	if err != nil {
 		response.Fail(c, err)
 		return

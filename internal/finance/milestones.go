@@ -5,6 +5,7 @@ package finance
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -73,6 +74,10 @@ type Milestone struct {
 	// Status: wait (not collectable yet), later (due in more than 30 days), soon, late, paid.
 	Status   string `json:"status"`
 	DaysLate int    `json:"days_late,omitempty"`
+	// Editable: no issued invoice is linked, so the term can still be corrected (even on an active contract).
+	Editable bool `json:"editable"`
+	// Deletable: nothing was invoiced or paid against it.
+	Deletable bool `json:"deletable"`
 }
 
 // milestoneSQL loads milestones with what decides their trigger date: the contract's
@@ -86,7 +91,9 @@ SELECT m.id, m.contract_id, c.number, c.customer_id, cu.name, m.seq, m.version, 
             UNION ALL SELECT v.number, v.done_on FROM service_visits v -- service visits finish service lines (5.13)
             WHERE v.contract_id = c.id AND v.status = 'done' AND EXISTS (SELECT 1 FROM service_visit_lines vl WHERE vl.visit_id = v.id)
         ) x ORDER BY x.on_date DESC, x.number DESC LIMIT 1) AS last_delivery,
-       coalesce((SELECT sum(a.amount) FROM receipt_allocations a WHERE a.milestone_id = m.id AND a.reversed_at IS NULL), 0)::text
+       coalesce((SELECT sum(a.amount) FROM receipt_allocations a WHERE a.milestone_id = m.id AND a.reversed_at IS NULL), 0)::text,
+       NOT EXISTS (SELECT 1 FROM sales_invoices si WHERE si.milestone_id = m.id AND si.status = 'issued') AND c.status IN ('draft', 'active'),
+       NOT EXISTS (SELECT 1 FROM sales_invoices si WHERE si.milestone_id = m.id) AND NOT EXISTS (SELECT 1 FROM receipt_allocations a WHERE a.milestone_id = m.id) AND c.status IN ('draft', 'active')
 FROM payment_milestones m JOIN contracts c ON c.id = m.contract_id JOIN organizations cu ON cu.id = c.customer_id`
 
 func (h *Handlers) loadMilestones(ctx context.Context, q db.Querier, where string, withMoney bool, args ...any) ([]Milestone, error) {
@@ -106,7 +113,7 @@ func (h *Handlers) loadMilestones(ctx context.Context, q db.Querier, where strin
 		var fullyDelivered bool
 		var lastDelivery *string
 		if err := rows.Scan(&m.ID, &m.ContractID, &number, &m.CustomerID, &m.CustomerName, &m.Seq, &m.Version, &m.Name, &percent, &amount, &m.Currency, &m.Trigger,
-			&m.DaysAfter, &fixed, &triggered, &m.TriggerNote, &m.AcceptanceID, &signed, &fullyDelivered, &lastDelivery, &paid); err != nil {
+			&m.DaysAfter, &fixed, &triggered, &m.TriggerNote, &m.AcceptanceID, &signed, &fullyDelivered, &lastDelivery, &paid, &m.Editable, &m.Deletable); err != nil {
 			return nil, err
 		}
 		if number != nil {
@@ -220,6 +227,9 @@ func CreateDraftTerms(ctx context.Context, tx pgx.Tx, contractID, actor uuid.UUI
 		if err := audit.Record(ctx, tx, "create", "payment_milestone", id, map[string]any{"name": term.Name, "amount": amount.String(), "trigger": term.Trigger}); err != nil {
 			return err
 		}
+		if err := checkTerm(ctx, tx, contractID, &id, fmt.Sprintf("milestones[%d].", i), pct, amount); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -300,6 +310,9 @@ func (h *Handlers) CreateMilestone(c *gin.Context) {
 		if _, err := tx.Exec(ctx, `SELECT id FROM contract_lines WHERE contract_id=$1 ORDER BY id FOR UPDATE`, id); err != nil {
 			return nil, err
 		}
+		if err := checkTerm(ctx, tx, id, nil, "", pct, amount); err != nil {
+			return nil, err
+		}
 		var mid uuid.UUID
 		if err := tx.QueryRow(ctx, `INSERT INTO payment_milestones (contract_id, seq, name, percent, amount, trigger, days_after, fixed_due_on, created_by)
 			VALUES ($1, coalesce((SELECT max(seq) FROM payment_milestones WHERE contract_id = $1), 0) + 1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
@@ -378,12 +391,16 @@ func (h *Handlers) UpdateMilestone(c *gin.Context) {
 		if amount.LessThan(decimalx.MustParse(paid)) {
 			return nil, apperrors.Invalid("amount", "below_paid", map[string]any{"paid": paid})
 		}
-		var triggered bool
-		if err := tx.QueryRow(ctx, `SELECT triggered_on IS NOT NULL OR EXISTS(SELECT 1 FROM sales_invoices WHERE milestone_id=m.id) OR EXISTS(SELECT 1 FROM receipt_allocations WHERE milestone_id=m.id) FROM payment_milestones m WHERE id=$1`, id).Scan(&triggered); err != nil {
+		// Paid money stays valid (the amount cannot go below it); an issued invoice must be cancelled first.
+		var invoiced bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sales_invoices WHERE milestone_id=$1 AND status='issued')`, id).Scan(&invoiced); err != nil {
 			return nil, err
 		}
-		if triggered {
-			return nil, apperrors.Rule("milestone_in_use", "Correct linked events and money before changing this term.", nil)
+		if invoiced {
+			return nil, apperrors.Rule("milestone_invoiced", "Cancel the invoice issued for this term before changing it.", nil)
+		}
+		if err := checkTerm(ctx, tx, contractID, &id, "", pct, amount); err != nil {
+			return nil, err
 		}
 		if err := recordTermHistory(ctx, tx, id, p.UserID); err != nil {
 			return nil, err
@@ -429,12 +446,15 @@ func (h *Handlers) DeleteMilestone(c *gin.Context) {
 			return nil, apperrors.Rule("contract_not_open", "This contract's terms cannot change.", nil)
 		}
 		var used bool
-		if err := tx.QueryRow(ctx, `SELECT m.triggered_on IS NOT NULL OR EXISTS(SELECT 1 FROM payment_term_history WHERE milestone_id=m.id) OR EXISTS (SELECT 1 FROM receipt_allocations WHERE milestone_id = m.id) OR EXISTS (SELECT 1 FROM sales_invoices WHERE milestone_id = m.id)
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM receipt_allocations WHERE milestone_id = m.id) OR EXISTS (SELECT 1 FROM sales_invoices WHERE milestone_id = m.id)
 			FROM payment_milestones m JOIN contracts c ON c.id = m.contract_id WHERE m.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2) FOR UPDATE OF m`, id, scopeFor(p)).Scan(&used); err != nil {
 			return nil, err
 		}
 		if used {
 			return nil, apperrors.Rule("milestone_in_use", "Money or an invoice is already linked to this milestone.", nil)
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM payment_term_history WHERE milestone_id = $1`, id); err != nil {
+			return nil, err
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM payment_milestones WHERE id = $1`, id); err != nil {
 			return nil, err
@@ -614,6 +634,10 @@ func (h *Handlers) Receivables(c *gin.Context) {
 		sum(strings.TrimSpace(cur)).Uncollected = decimalx.MustParse(v)
 	}
 	vrows.Close()
+	if err := vrows.Err(); err != nil {
+		response.Fail(c, err)
+		return
+	}
 	urows, err := h.Pool.Query(ctx, `SELECT r.currency, sum(r.amount - coalesce((SELECT sum(a.amount) FROM receipt_allocations a WHERE a.receipt_id = r.id AND a.reversed_at IS NULL), 0))::text
 		FROM receipts r WHERE r.status = 'posted' AND ($1::uuid IS NULL OR r.customer_id=$1) GROUP BY r.currency`, customer)
 	if err != nil {
@@ -630,6 +654,10 @@ func (h *Handlers) Receivables(c *gin.Context) {
 		sum(strings.TrimSpace(cur)).Unallocated = decimalx.MustParse(v)
 	}
 	urows.Close()
+	if err := urows.Err(); err != nil {
+		response.Fail(c, err)
+		return
+	}
 	summary := []CurrencySummary{}
 	for _, s := range sums {
 		summary = append(summary, *s)

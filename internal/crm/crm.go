@@ -253,6 +253,10 @@ func (h *Handlers) ListNotes(c *gin.Context) {
 		ids = append(ids, n.ID)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		response.Fail(c, err)
+		return
+	}
 	out := []*Note{}
 	for _, id := range ids {
 		n, err := h.loadNote(ctx, h.Pool, id)

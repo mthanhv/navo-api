@@ -47,7 +47,9 @@ type Contract struct {
 	ServiceFrom *string `json:"service_from"`
 	ServiceTo   *string `json:"service_to"`
 	// Value is the sum of quantity × unit price (sales prices, visible with the contract).
-	Value      string    `json:"value"`
+	Value string `json:"value"`
+	// Total is Value plus VAT (per line rate, rounded to the currency's unit); payment terms add up to it.
+	Total      string    `json:"total"`
 	FinalDueOn *string   `json:"final_due_on"`
 	Lines      []LineRow `json:"lines,omitempty"`
 	Summary    *Summary  `json:"summary,omitempty"`
@@ -70,18 +72,20 @@ type ContractAttention struct {
 const contractSelect = `SELECT c.id, c.number, c.draft_number, c.status, c.customer_id, o.code, o.name, c.title,
 	c.customer_reference, c.currency, c.signed_on, c.owner_id, u.full_name, c.version, c.delivery_location, c.kind, c.service_from, c.service_to,
 	(SELECT coalesce(round(sum(cl.quantity * cl.unit_price), 2), 0)::text FROM contract_lines cl WHERE cl.contract_id = c.id),
-	(SELECT max(cl.due_on) FROM contract_lines cl WHERE cl.contract_id = c.id)
+	(SELECT max(cl.due_on) FROM contract_lines cl WHERE cl.contract_id = c.id),
+	` + finance.ContractTotalSQL + `::text
 	FROM contracts c JOIN organizations o ON o.id = c.customer_id JOIN users u ON u.id = c.owner_id`
 
 func scanContract(row pgx.Row) (Contract, error) {
 	var k Contract
 	var signed, finalDue, from, to *time.Time
 	err := row.Scan(&k.ID, &k.Number, &k.DraftNumber, &k.Status, &k.CustomerID, &k.CustomerCode, &k.CustomerName, &k.Title,
-		&k.CustomerReference, &k.Currency, &signed, &k.OwnerID, &k.OwnerName, &k.Version, &k.DeliveryLocation, &k.Kind, &from, &to, &k.Value, &finalDue)
+		&k.CustomerReference, &k.Currency, &signed, &k.OwnerID, &k.OwnerName, &k.Version, &k.DeliveryLocation, &k.Kind, &from, &to, &k.Value, &finalDue, &k.Total)
 	k.SignedOn, k.FinalDueOn = dateString(signed), dateString(finalDue)
 	k.ServiceFrom, k.ServiceTo = dateString(from), dateString(to)
 	if err == nil {
 		k.Value = decimalx.MustParse(k.Value).String()
+		k.Total = decimalx.MustParse(k.Total).String()
 	}
 	return k, err
 }
@@ -477,8 +481,8 @@ func (h *Handlers) ListContracts(c *gin.Context) {
 	}
 	rows, err := h.Pool.Query(ctx, contractSelect+`
 		WHERE ($1::uuid IS NULL OR c.owner_id = $1) AND c.status = ANY($2) AND ($4::uuid IS NULL OR c.customer_id = $4) AND ($5 = '' OR c.kind = $5)
-		  AND ($3 = '' OR c.number ILIKE '%' || $3 || '%' OR c.draft_number ILIKE '%' || $3 || '%' OR c.title ILIKE '%' || $3 || '%'
-		       OR o.name ILIKE '%' || $3 || '%' OR o.code ILIKE '%' || $3 || '%' OR c.customer_reference ILIKE '%' || $3 || '%')
+		  AND ($3 = '' OR strpos(vn_fold(c.number), vn_fold($3)) > 0 OR strpos(vn_fold(c.draft_number), vn_fold($3)) > 0 OR strpos(vn_fold(c.title), vn_fold($3)) > 0
+		       OR strpos(vn_fold(o.name), vn_fold($3)) > 0 OR strpos(vn_fold(o.code), vn_fold($3)) > 0 OR strpos(vn_fold(c.customer_reference), vn_fold($3)) > 0)
 		ORDER BY (c.status = 'active') DESC, c.number DESC NULLS LAST, c.created_at DESC, c.id`, owner, statuses, q, customer, kind)
 	if err != nil {
 		response.Fail(c, err)
@@ -607,8 +611,8 @@ type Owner struct {
 // ListOwners handles GET /contracts/owners: people who own contracts the caller can see.
 func (h *Handlers) ListOwners(c *gin.Context) {
 	p := auth.Principal(c)
-	rows, err := h.Pool.Query(c.Request.Context(), `SELECT DISTINCT u.id, u.full_name FROM contracts c JOIN users u ON u.id = c.owner_id
-		WHERE ($1::uuid IS NULL OR c.owner_id = $1) ORDER BY u.full_name, u.id`, p.OwnerFilter())
+	rows, err := h.Pool.Query(c.Request.Context(), `SELECT id, full_name FROM (SELECT DISTINCT u.id, u.full_name FROM contracts c JOIN users u ON u.id = c.owner_id
+		WHERE ($1::uuid IS NULL OR c.owner_id = $1)) o ORDER BY vn_fold(full_name), full_name, id`, p.OwnerFilter())
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -659,6 +663,9 @@ func (h *Handlers) ActivateContract(c *gin.Context) {
 		}
 		if k.Status != "draft" {
 			return nil, apperrors.Rule("contract_not_draft", "Only a draft contract can be activated.", map[string]any{"status": k.Status})
+		}
+		if err := finance.CheckTermsComplete(ctx, tx, id); err != nil {
+			return nil, err
 		}
 		seq, err := numbering.NextYearly(ctx, tx, "SC", signed.Year())
 		if err != nil {

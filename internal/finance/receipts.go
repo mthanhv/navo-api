@@ -95,6 +95,9 @@ func (h *Handlers) loadReceipt(ctx context.Context, q db.Querier, id uuid.UUID, 
 		r.Allocations = append(r.Allocations, a)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	ms, err := h.loadMilestones(ctx, q, `c.customer_id = $1 AND c.currency = $2 AND c.status IN ('active', 'closed')`, true, r.CustomerID, r.Currency)
 	if err != nil {
 		return nil, err
@@ -156,8 +159,10 @@ func (h *Handlers) CreateReceipt(c *gin.Context) {
 	} else if on.After(h.today()) {
 		errs.Add("received_on", "not_future", nil)
 	}
-	amount := decimalx.Positive(&errs, "amount", in.Amount).Round(2)
+	amount := decimalx.Positive(&errs, "amount", in.Amount)
 	cur := currency(&errs, in.Currency)
+	decimalx.CheckMoney(&errs, "amount", amount, cur)
+	amount = amount.Round(2)
 	if in.Method != "bank" && in.Method != "cash" {
 		errs.Add("method", "one_of", map[string]any{"values": []string{"bank", "cash"}})
 	}
@@ -233,28 +238,35 @@ func (h *Handlers) ListReceipts(c *gin.Context) {
 	if c.Query("unallocated") == "1" {
 		where = append(where, `r.status = 'posted' AND r.amount > coalesce((SELECT sum(a.amount) FROM receipt_allocations a WHERE a.receipt_id = r.id AND a.reversed_at IS NULL), 0)`)
 	}
-	rows, err := h.Pool.Query(ctx, receiptSelect+` WHERE `+strings.Join(where, " AND ")+` ORDER BY r.received_on DESC, r.number DESC`, args...)
+	filter := ` WHERE ` + strings.Join(where, " AND ")
+	var total int
+	if err := h.Pool.QueryRow(ctx, `SELECT count(*) FROM receipts r`+filter, args...).Scan(&total); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	// Page in SQL: receipts grow every day and nothing here is computed after loading.
+	n := len(args)
+	rows, err := h.Pool.Query(ctx, receiptSelect+filter+fmt.Sprintf(` ORDER BY r.received_on DESC, r.number DESC LIMIT $%d OFFSET $%d`, n+1, n+2),
+		append(args, size, (page-1)*size)...)
 	if err != nil {
 		response.Fail(c, err)
 		return
 	}
 	defer rows.Close()
-	all := []*Receipt{}
+	out := []*Receipt{}
 	for rows.Next() {
 		r, err := scanReceipt(rows)
 		if err != nil {
 			response.Fail(c, err)
 			return
 		}
-		all = append(all, r)
+		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
 		response.Fail(c, err)
 		return
 	}
-	start := min((page-1)*size, len(all))
-	end := min(start+size, len(all))
-	response.List(c, all[start:end], page, size, len(all))
+	response.List(c, out, page, size, total)
 }
 
 type allocateInput struct {
@@ -386,8 +398,12 @@ func (h *Handlers) ReverseAllocation(c *gin.Context) {
 		return
 	}
 	in.Reason = strings.TrimSpace(in.Reason)
-	if in.Reason == "" || len([]rune(in.Reason)) > 300 {
+	if in.Reason == "" {
 		response.Fail(c, apperrors.Invalid("reason", "required", nil))
+		return
+	}
+	if len([]rune(in.Reason)) > 500 { // the same limit as every other correction reason
+		response.Fail(c, apperrors.Invalid("reason", "too_long", map[string]any{"max": 500}))
 		return
 	}
 	httpx.Command(c, h.Pool, "allocations.reverse", true, 200, func(tx pgx.Tx) (any, error) {

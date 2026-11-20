@@ -66,4 +66,20 @@ func TestListTabsFiltersAndSearch(t *testing.T) {
 	if one := e.must(200, e.do(ha, "GET", "/api/v1/search?q=a", nil, nil), "short")["contracts"].([]any); len(one) != 0 {
 		t.Fatal("one character searches nothing")
 	}
+
+	lineID := lineByNo(got, 1)["contract_line_id"].(string)
+	var newestID string
+	for range 26 {
+		order := e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+k1+"/delivery-orders", map[string]any{
+			"firmness":      "tentative",
+			"over_contract": true, // many small plans to fill a page; plan limits are tested elsewhere
+			"lines":         []any{map[string]any{"contract_line_id": lineID, "quantity": "1"}},
+		}, nil), "create undated plan")
+		newestID = order["id"].(string)
+	}
+	planned := e.must(200, e.do(khoa, "GET", "/api/v1/delivery-orders?view=planned&page_size=25", nil, nil), "planned deliveries")
+	items := planned["items"].([]any)
+	if len(items) != 25 || items[0].(map[string]any)["id"] != newestID {
+		t.Fatalf("newest undated plan should be visible on the first page: %v", items)
+	}
 }

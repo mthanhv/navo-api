@@ -240,7 +240,7 @@ func TestContractToDeliveryFlow(t *testing.T) {
 	// AC-04: a draft delivery does not count; confirming counts once even when retried.
 	newDO := func(qty string) map[string]any {
 		return e.must(201, e.do(sales, "POST", "/api/v1/contracts/"+contractID+"/delivery-orders", map[string]any{
-			"lines": []any{map[string]any{"contract_line_id": line1, "quantity": qty}}}, nil), "create DO "+qty)
+			"lines": []any{map[string]any{"contract_line_id": line1, "quantity": qty}}, "over_contract": true}, nil), "create DO "+qty) // drafts beyond the contract on purpose: confirmation is what is tested
 	}
 	do1 := newDO("20")
 	report := func() map[string]any {
@@ -470,7 +470,7 @@ func TestOverrideApprovalAndLists(t *testing.T) {
 		"lines": []any{map[string]any{"purchase_order_line_id": poLine, "accepted_quantity": "12"}}}, nil), "gr")
 	e.must(200, e.do(sales, "POST", "/api/v1/goods-receipts/"+gr["id"].(string)+"/confirm", nil, key("gr")), "confirm gr")
 	newDO := func(q string) string {
-		return e.must(201, e.do(sales, "POST", "/api/v1/contracts/"+cid+"/delivery-orders", map[string]any{"lines": []any{map[string]any{"contract_line_id": line, "quantity": q}}}, nil), "do")["id"].(string)
+		return e.must(201, e.do(sales, "POST", "/api/v1/contracts/"+cid+"/delivery-orders", map[string]any{"lines": []any{map[string]any{"contract_line_id": line, "quantity": q}}, "over_contract": true}, nil), "do")["id"].(string)
 	}
 	do1 := newDO("11")
 	if r := e.do(sales, "POST", "/api/v1/delivery-orders/"+do1+"/confirm", map[string]any{"delivered_on": "2026-09-05"}, key("d1")); r.reason() != "delivery_exceeds_contract" {

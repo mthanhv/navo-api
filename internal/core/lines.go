@@ -47,10 +47,14 @@ type LineRow struct {
 	// Received are net of customer and supplier returns.
 	Accepted decimal.Decimal `json:"accepted"`
 	// UnitPrice is the contract's sales price for the line (visible with the contract, never a purchase price).
-	UnitPrice            decimal.Decimal `json:"unit_price"`
-	Remaining            decimal.Decimal `json:"remaining"`
-	Over                 decimal.Decimal `json:"over"`
-	Available            decimal.Decimal `json:"available"`
+	UnitPrice decimal.Decimal `json:"unit_price"`
+	Remaining decimal.Decimal `json:"remaining"`
+	Over      decimal.Decimal `json:"over"`
+	Available decimal.Decimal `json:"available"`
+	// Planned is on open (draft) deliveries or planned service visits, dated or not; Unplanned is
+	// what still needs a plan: max(remaining - planned, 0).
+	Planned              decimal.Decimal `json:"planned"`
+	Unplanned            decimal.Decimal `json:"unplanned"`
 	DueOn                *string         `json:"due_on"`
 	NextDelivery         *NextDelivery   `json:"next_delivery"`
 	Flags                []progress.Flag `json:"flags"`
@@ -106,16 +110,28 @@ WITH lines AS (
         WHERE v.status = 'planned' AND v.planned_on IS NOT NULL AND vl.contract_line_id IN (SELECT id FROM lines)
     ) plans
     ORDER BY contract_line_id, planned_on, number
+), planned AS (
+    SELECT contract_line_id, sum(quantity) AS q FROM (
+        SELECT dol.contract_line_id, dol.quantity
+        FROM delivery_order_lines dol JOIN delivery_orders d ON d.id = dol.delivery_order_id
+        WHERE d.status = 'draft' AND dol.contract_line_id IN (SELECT id FROM lines)
+        UNION ALL
+        SELECT vl.contract_line_id, vl.quantity
+        FROM service_visit_lines vl JOIN service_visits v ON v.id = vl.visit_id
+        WHERE v.status = 'planned' AND vl.contract_line_id IN (SELECT id FROM lines)
+    ) p GROUP BY 1
 )
 SELECT l.id, l.contract_id, l.contract_number, l.customer_id, l.customer_name, l.owner_id, l.owner_name, l.line_no, l.name_on_contract,
        l.unit, l.quantity::text, coalesce(o.q, 0)::text, coalesce(r.q, 0)::text, coalesce(d.q, 0)::text, coalesce(d.a, 0)::text, l.unit_price::text, l.due_on,
-       coalesce(lr.late, false), np.number, np.planned_on, np.firmness, np.quantity::text, l.last_business_change_at, l.line_type
+       coalesce(lr.late, false), np.number, np.planned_on, np.firmness, np.quantity::text, l.last_business_change_at, l.line_type,
+       coalesce(pl.q, 0)::text
 FROM lines l
 LEFT JOIN ordered o ON o.contract_line_id = l.id
 LEFT JOIN received r ON r.contract_line_id = l.id
 LEFT JOIN delivered d ON d.contract_line_id = l.id
 LEFT JOIN late_receipts lr ON lr.contract_line_id = l.id
 LEFT JOIN next_plan np ON np.contract_line_id = l.id
+LEFT JOIN planned pl ON pl.contract_line_id = l.id
 ORDER BY l.contract_number, l.line_no`
 
 // QueryLines returns line progress for the caller's scope. With contractID it
@@ -133,20 +149,20 @@ func QueryLines(ctx context.Context, q db.Querier, owner, contractID *uuid.UUID,
 	out := []LineRow{}
 	for rows.Next() {
 		var r LineRow
-		var qty, ordered, received, delivered, accepted, price string
+		var qty, ordered, received, delivered, accepted, price, planned string
 		var due *time.Time
 		var late bool
 		var planNumber, planFirmness, planQty *string
 		var planOn *time.Time
 		if err := rows.Scan(&r.ContractLineID, &r.ContractID, &r.ContractNumber, &r.CustomerID, &r.CustomerName, &r.OwnerID, &r.OwnerName,
 			&r.LineNo, &r.NameOnContract, &r.Unit, &qty, &ordered, &received, &delivered, &accepted, &price, &due, &late,
-			&planNumber, &planOn, &planFirmness, &planQty, &r.LastBusinessChangeAt, &r.LineType); err != nil {
+			&planNumber, &planOn, &planFirmness, &planQty, &r.LastBusinessChangeAt, &r.LineType, &planned); err != nil {
 			return nil, err
 		}
 		facts := progress.Facts{
 			Contract: decimalx.MustParse(qty), Ordered: decimalx.MustParse(ordered),
 			Received: decimalx.MustParse(received), Delivered: decimalx.MustParse(delivered),
-			DueOn: due, ReceiptOverdue: late,
+			DueOn: due, ReceiptOverdue: late, Planned: decimalx.MustParse(planned),
 		}
 		if planNumber != nil {
 			facts.NextPlan = &progress.Plan{Number: *planNumber, On: *planOn, Firm: *planFirmness == "firm", Quantity: decimalx.MustParse(*planQty)}
@@ -154,6 +170,7 @@ func QueryLines(ctx context.Context, q db.Querier, owner, contractID *uuid.UUID,
 		}
 		r.ContractQuantity, r.Ordered, r.Received, r.Delivered = facts.Contract, facts.Ordered, facts.Received, facts.Delivered
 		r.Remaining, r.Over, r.Available = progress.Remaining(facts), progress.Over(facts), progress.Available(facts)
+		r.Planned, r.Unplanned = facts.Planned, progress.Unplanned(facts)
 		if r.LineType == "service" {
 			// A service is done by visiting, not bought and stocked: the ordering and receiving
 			// rules do not apply. "No plan" then means visits not scheduled, "overdue" a visit missed.

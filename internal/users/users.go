@@ -143,7 +143,7 @@ func (h *Handlers) ListUsers(c *gin.Context) {
 			coalesce((SELECT array_agg(grant_code ORDER BY grant_code) FROM user_grants WHERE user_id = u.id), '{}'),
 			(SELECT max(created_at) FROM sessions WHERE user_id = u.id), u.totp_enabled_at IS NOT NULL,
 			count(*) OVER ()
-		FROM users u ORDER BY u.full_name, u.id LIMIT $1 OFFSET $2`, size, (page-1)*size)
+		FROM users u ORDER BY vn_fold(u.full_name), u.full_name, u.id LIMIT $1 OFFSET $2`, size, (page-1)*size)
 	if err != nil {
 		response.Fail(c, err)
 		return

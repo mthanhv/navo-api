@@ -77,8 +77,9 @@ type QuotationLine struct {
 
 const quotationSelect = `SELECT q.id, q.number, q.revision, q.status, q.customer_id, o.code, o.name, q.contact_id, ct.full_name, q.title, q.currency,
 	to_char(q.valid_until,'YYYY-MM-DD'), q.terms, to_char(q.sent_on,'YYYY-MM-DD'), q.lost_reason, q.contract_id, k.number, q.owner_id, u.full_name, q.version, q.created_at,
-	COALESCE((SELECT sum(l.quantity*l.unit_price) FROM quotation_lines l WHERE l.quotation_id=q.id),0)::text,
-	COALESCE((SELECT sum(round(l.quantity*l.unit_price*COALESCE(l.tax_rate,0),2)) FROM quotation_lines l WHERE l.quotation_id=q.id),0)::text,
+	COALESCE((SELECT sum(round(l.quantity*l.unit_price,2)) FROM quotation_lines l WHERE l.quotation_id=q.id),0)::text,
+	-- VAT per line, rounded to the currency's unit (whole đồng for VND), like contract totals.
+	COALESCE((SELECT sum(round(l.quantity*l.unit_price*COALESCE(l.tax_rate,0), CASE WHEN q.currency='VND' THEN 0 ELSE 2 END)) FROM quotation_lines l WHERE l.quotation_id=q.id),0)::text,
 	(SELECT count(*) FROM quotation_lines l WHERE l.quotation_id=q.id)
 	FROM quotations q JOIN organizations o ON o.id=q.customer_id JOIN users u ON u.id=q.owner_id
 	LEFT JOIN contacts ct ON ct.id=q.contact_id LEFT JOIN contracts k ON k.id=q.contract_id`
@@ -144,7 +145,7 @@ func (h *Handlers) ListQuotations(c *gin.Context) {
 	q := strings.TrimSpace(c.Query("q"))
 	rows, err := h.Pool.Query(c.Request.Context(), quotationSelect+`
 		WHERE ($1::uuid IS NULL OR q.owner_id=$1)
-		  AND ($2='' OR q.number ILIKE '%'||$2||'%' OR q.title ILIKE '%'||$2||'%' OR o.name ILIKE '%'||$2||'%' OR o.code ILIKE '%'||$2||'%')
+		  AND ($2='' OR strpos(vn_fold(q.number), vn_fold($2)) > 0 OR strpos(vn_fold(q.title), vn_fold($2)) > 0 OR strpos(vn_fold(o.name), vn_fold($2)) > 0 OR strpos(vn_fold(o.code), vn_fold($2)) > 0)
 		ORDER BY (q.status IN ('draft','sent')) DESC, q.valid_until, q.created_at DESC, q.id`, p.OwnerFilter(), q)
 	if err != nil {
 		response.Fail(c, err)

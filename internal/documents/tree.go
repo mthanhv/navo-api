@@ -55,7 +55,7 @@ func (h *Handlers) Tree(c *gin.Context) {
 		FROM contracts c JOIN organizations cu ON cu.id = c.customer_id
 		WHERE ($1::uuid IS NULL OR c.owner_id = $1) AND c.status = ANY($2)
 		  AND ($3 = '' OR substr(c.number, 4, 2) = $3)
-		ORDER BY cu.name, cu.id, (c.status = 'active') DESC, (c.status = 'draft'), c.number DESC NULLS LAST, c.created_at DESC`, p.OwnerFilter(), statuses, year)
+		ORDER BY vn_fold(cu.name), cu.name, cu.id, (c.status = 'active') DESC, (c.status = 'draft'), c.number DESC NULLS LAST, c.created_at DESC`, p.OwnerFilter(), statuses, year)
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -123,6 +123,10 @@ func (h *Handlers) Tree(c *gin.Context) {
 		}
 	}
 	lrows.Close()
+	if err := lrows.Err(); err != nil {
+		response.Fail(c, err)
+		return
+	}
 	for _, cu := range out {
 		cu.GeneralFiles = general[cu.ID]
 	}
@@ -302,6 +306,9 @@ func (h *Handlers) contractDocs(ctx context.Context, p *access.Principal, id uui
 		pos = append(pos, x)
 	}
 	porows.Close()
+	if err := porows.Err(); err != nil {
+		return nil, err
+	}
 	for _, x := range pos {
 		files := append([]FileItem{}, byOwner[x.id]...)
 		var refs []GroupRef
@@ -351,6 +358,9 @@ func (h *Handlers) contractDocs(ctx context.Context, p *access.Principal, id uui
 		s3.Files += len(g.Files)
 	}
 	drows.Close()
+	if err := drows.Err(); err != nil {
+		return nil, err
+	}
 	s3.Docs = len(s3.Groups)
 
 	// 4 and 5: money documents, only with finance access.
@@ -377,6 +387,9 @@ func (h *Handlers) contractDocs(ctx context.Context, p *access.Principal, id uui
 			s4.Files += len(g.Files)
 		}
 		irows.Close()
+		if err := irows.Err(); err != nil {
+			return nil, err
+		}
 		s4.Docs = len(s4.Groups)
 		rrows, err := h.Pool.Query(ctx, `SELECT DISTINCT r.id, r.number, r.amount::text, r.currency, r.received_on FROM receipts r
 			JOIN receipt_allocations a ON a.receipt_id = r.id JOIN payment_milestones m ON m.id = a.milestone_id
@@ -397,6 +410,9 @@ func (h *Handlers) contractDocs(ctx context.Context, p *access.Principal, id uui
 			s5.Groups = append(s5.Groups, Group{OwnerType: OwnerReceipt, OwnerID: rid, Title: number, Meta: map[string]any{"amount": amount, "currency": cur, "date": on.Format(time.DateOnly)}, Kinds: KindsFor(OwnerReceipt)})
 		}
 		rrows.Close()
+		if err := rrows.Err(); err != nil {
+			return nil, err
+		}
 		if len(rids) > 0 {
 			// Receipts belong to a customer, not one contract, so their files are looked up by owner.
 			rf, err := h.visibleLinks(ctx, p, `l.owner_type = 'receipt' AND l.owner_id = ANY($1)`, rids)

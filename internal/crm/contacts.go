@@ -179,7 +179,7 @@ func (h *Handlers) ListContacts(c *gin.Context) {
 // after that have an address and have not asked to stop product news — who a mailing may go to.
 func (h *Handlers) ListEmailContacts(c *gin.Context) {
 	rows, err := h.Pool.Query(c.Request.Context(), contactSelect+` WHERE (o.is_customer OR o.lead_stage IS NOT NULL) AND ct.email IS NOT NULL AND ct.accepts_email AND `+Manageable(1)+`
-		ORDER BY o.name, ct.is_primary DESC, ct.full_name, ct.id LIMIT 2000`, auth.Principal(c).OwnerFilter())
+		ORDER BY vn_fold(o.name), o.name, ct.is_primary DESC, ct.full_name, ct.id LIMIT 2000`, auth.Principal(c).OwnerFilter())
 	if err != nil {
 		response.Fail(c, err)
 		return

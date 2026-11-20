@@ -44,30 +44,30 @@ func (h *Handlers) Search(c *gin.Context) {
 	if out.Contracts, err = hits(ctx, h, `SELECT c.id, coalesce(c.number, c.draft_number), c.title || ' · ' || o.name, NULL::uuid
 		FROM contracts c JOIN organizations o ON o.id = c.customer_id
 		WHERE ($1::uuid IS NULL OR c.owner_id = $1) AND c.status <> 'cancelled'
-		  AND (c.number ILIKE '%' || $2 || '%' OR c.draft_number ILIKE '%' || $2 || '%' OR c.title ILIKE '%' || $2 || '%'
-		       OR c.customer_reference ILIKE '%' || $2 || '%' OR o.name ILIKE '%' || $2 || '%')
+		  AND (strpos(vn_fold(c.number), vn_fold($2)) > 0 OR strpos(vn_fold(c.draft_number), vn_fold($2)) > 0 OR strpos(vn_fold(c.title), vn_fold($2)) > 0
+		       OR strpos(vn_fold(c.customer_reference), vn_fold($2)) > 0 OR strpos(vn_fold(o.name), vn_fold($2)) > 0)
 		ORDER BY c.number DESC NULLS LAST LIMIT 5`, owner, q); err != nil {
 		response.Fail(c, err)
 		return
 	}
 	if out.PurchaseOrders, err = hits(ctx, h, `SELECT po.id, po.number, s.name || ' · ' || c.number, c.id
 		FROM purchase_orders po JOIN contracts c ON c.id = po.contract_id JOIN organizations s ON s.id = po.supplier_id
-		WHERE ($1::uuid IS NULL OR c.owner_id = $1) AND (po.number ILIKE '%' || $2 || '%' OR s.name ILIKE '%' || $2 || '%')
+		WHERE ($1::uuid IS NULL OR c.owner_id = $1) AND (strpos(vn_fold(po.number), vn_fold($2)) > 0 OR strpos(vn_fold(s.name), vn_fold($2)) > 0)
 		ORDER BY po.number DESC LIMIT 5`, owner, q); err != nil {
 		response.Fail(c, err)
 		return
 	}
 	if out.DeliveryOrders, err = hits(ctx, h, `SELECT d.id, d.number, o.name || ' · ' || c.number, c.id
 		FROM delivery_orders d JOIN contracts c ON c.id = d.contract_id JOIN organizations o ON o.id = c.customer_id
-		WHERE ($1::uuid IS NULL OR c.owner_id = $1) AND d.number ILIKE '%' || $2 || '%'
+		WHERE ($1::uuid IS NULL OR c.owner_id = $1) AND strpos(vn_fold(d.number), vn_fold($2)) > 0
 		ORDER BY d.number DESC LIMIT 5`, owner, q); err != nil {
 		response.Fail(c, err)
 		return
 	}
 	// Customers: everyone with contract access may look up partners (master data is shared).
 	if out.Customers, err = hits(ctx, h, `SELECT id, code, name, NULL::uuid FROM organizations
-		WHERE $1::uuid IS NULL AND is_customer AND (code ILIKE '%' || $2 || '%' OR name ILIKE '%' || $2 || '%')
-		ORDER BY name LIMIT 5`, nil, q); err != nil {
+		WHERE $1::uuid IS NULL AND is_customer AND (strpos(vn_fold(code), vn_fold($2)) > 0 OR strpos(vn_fold(name), vn_fold($2)) > 0)
+		ORDER BY vn_fold(name), name LIMIT 5`, nil, q); err != nil {
 		response.Fail(c, err)
 		return
 	}

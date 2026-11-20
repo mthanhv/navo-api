@@ -113,6 +113,10 @@ func (h *Handlers) ContractDraft(c *gin.Context) {
 			customers = append(customers, cand)
 		}
 		rows.Close()
+		if err := rows.Err(); err != nil {
+			response.Fail(c, err)
+			return
+		}
 		ranked := rank(draft.Customer.Name, customers, func(x Candidate) string { return x.Name })
 		if len(ranked) > 0 && ranked[0].score >= 0.999 {
 			customer = &ranked[0].c

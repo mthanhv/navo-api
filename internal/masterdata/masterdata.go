@@ -255,9 +255,9 @@ func (h *Handlers) ListOrganizations(c *gin.Context) {
 	total := 0
 	rows, err := h.Pool.Query(c.Request.Context(), orgSelect(5)+`, count(*) OVER () `+orgFrom+`
 		WHERE ($1 = '' OR ($1 = 'customer' AND o.is_customer) OR ($1 = 'supplier' AND o.is_supplier) OR ($1 = 'prospect' AND (o.is_customer OR (o.lead_stage IS NOT NULL AND o.lead_stage <> 'lost'))))
-		  AND ($2 = '' OR o.code ILIKE '%' || $2 || '%' OR o.name ILIKE '%' || $2 || '%'
-		       OR EXISTS (SELECT 1 FROM contacts ct WHERE ct.organization_id = o.id AND (ct.full_name ILIKE '%' || $2 || '%' OR ct.email ILIKE '%' || $2 || '%' OR ct.phone ILIKE '%' || $2 || '%')))
-		ORDER BY o.name, o.id LIMIT $3 OFFSET $4`, role, q, size, (page-1)*size, auth.Principal(c).OwnerFilter())
+		  AND ($2 = '' OR strpos(vn_fold(o.code), vn_fold($2)) > 0 OR strpos(vn_fold(o.name), vn_fold($2)) > 0
+		       OR EXISTS (SELECT 1 FROM contacts ct WHERE ct.organization_id = o.id AND (strpos(vn_fold(ct.full_name), vn_fold($2)) > 0 OR strpos(vn_fold(ct.email), vn_fold($2)) > 0 OR strpos(vn_fold(ct.phone), vn_fold($2)) > 0)))
+		ORDER BY vn_fold(o.name), o.name, o.id LIMIT $3 OFFSET $4`, role, q, size, (page-1)*size, auth.Principal(c).OwnerFilter())
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -419,8 +419,8 @@ func (h *Handlers) ListProducts(c *gin.Context) {
 	q := strings.TrimSpace(c.Query("q"))
 	rows, err := h.Pool.Query(c.Request.Context(), `SELECT p.id, p.code, p.name, p.manufacturer, p.manufacturer_code, p.unit, p.description, p.origin, p.supplier_id, s.name, p.supplier_item_code, count(*) OVER ()
 		FROM products p LEFT JOIN organizations s ON s.id = p.supplier_id
-		WHERE $1 = '' OR p.code ILIKE '%' || $1 || '%' OR p.name ILIKE '%' || $1 || '%' OR p.manufacturer_code ILIKE '%' || $1 || '%' OR p.manufacturer ILIKE '%' || $1 || '%' OR p.supplier_item_code ILIKE '%' || $1 || '%'
-		ORDER BY p.name, p.id LIMIT $2 OFFSET $3`, q, size, (page-1)*size)
+		WHERE $1 = '' OR strpos(vn_fold(p.code), vn_fold($1)) > 0 OR strpos(vn_fold(p.name), vn_fold($1)) > 0 OR strpos(vn_fold(p.manufacturer_code), vn_fold($1)) > 0 OR strpos(vn_fold(p.manufacturer), vn_fold($1)) > 0 OR strpos(vn_fold(p.supplier_item_code), vn_fold($1)) > 0
+		ORDER BY vn_fold(p.name), p.name, p.id LIMIT $2 OFFSET $3`, q, size, (page-1)*size)
 	if err != nil {
 		response.Fail(c, err)
 		return

@@ -21,7 +21,7 @@ func TestReliabilityRegressions(t *testing.T) {
 	cust := e.must(201, e.do(sales, "POST", "/api/v1/organizations", map[string]any{"code": "RVC", "name": "Review Customer", "is_customer": true}, nil), "customer")
 	sup := e.must(201, e.do(sales, "POST", "/api/v1/organizations", map[string]any{"code": "RVS", "name": "Review Supplier", "is_supplier": true}, nil), "supplier")
 	prod := e.must(201, e.do(sales, "POST", "/api/v1/products", map[string]any{"name": "Review Valve", "unit": "unit"}, nil), "product")
-	contractBody := map[string]any{"customer_id": cust["id"], "title": "Review contract", "currency": "VND", "lines": []any{map[string]any{"product_id": prod["id"], "quantity": "10", "unit_price": "10"}}}
+	contractBody := map[string]any{"customer_id": cust["id"], "title": "Review contract", "currency": "VND", "lines": []any{map[string]any{"product_id": prod["id"], "quantity": "10", "unit_price": "20"}}} // value 200: room for two terms of 100
 	contract := e.must(201, e.do(sales, "POST", "/api/v1/contracts", contractBody, key("create-review")), "contract")
 	cid := contract["id"].(string)
 	e.must(201, e.do(sales, "POST", "/api/v1/contracts", contractBody, key("create-review")), "create replay")

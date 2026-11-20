@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -80,6 +81,9 @@ type grLineInput struct {
 type grInput struct {
 	ReceivedOn *string       `json:"received_on"`
 	Lines      []grLineInput `json:"lines"`
+	// Confirm creates and confirms in one transaction: a refused confirmation leaves no
+	// cancelled draft behind and uses up no GR number.
+	Confirm bool `json:"confirm"`
 }
 
 // CreateGoodsReceipt handles POST /purchase-orders/:id/goods-receipts (a draft).
@@ -130,6 +134,10 @@ func (h *Handlers) CreateGoodsReceipt(c *gin.Context) {
 		response.Fail(c, err)
 		return
 	}
+	if in.Confirm && !p.Can(access.FulfillmentConfirm) {
+		response.Fail(c, apperrors.Forbidden(string(access.FulfillmentConfirm)))
+		return
+	}
 	httpx.Command(c, h.Pool, "goods_receipts.create", false, httpx.Created, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
 		var status string
@@ -160,6 +168,11 @@ func (h *Handlers) CreateGoodsReceipt(c *gin.Context) {
 		if err := audit.Record(ctx, tx, "create", "goods_receipt", id, map[string]any{"number": number, "purchase_order_id": poID, "lines": len(lines)}); err != nil {
 			return nil, err
 		}
+		if in.Confirm {
+			if err := confirmGRTx(ctx, tx, id, p.UserID); err != nil {
+				return nil, err
+			}
+		}
 		return loadGR(ctx, tx, id, p)
 	})
 }
@@ -183,57 +196,66 @@ func (h *Handlers) ConfirmGoodsReceipt(c *gin.Context) {
 		if status != "draft" {
 			return nil, apperrors.Rule("document_not_draft", "Only a draft goods receipt can be confirmed.", map[string]any{"status": status})
 		}
-		rows, err := tx.Query(ctx, `SELECT pol.id, pol.contract_line_id, cl.line_no, (pol.quantity-pol.cancelled_quantity)::text, grl.accepted_quantity::text
-			FROM purchase_order_lines pol JOIN goods_receipt_lines grl ON grl.purchase_order_line_id = pol.id AND grl.goods_receipt_id = $1
-			JOIN contract_lines cl ON cl.id = pol.contract_line_id
-			ORDER BY pol.id FOR UPDATE OF pol`, id)
-		if err != nil {
-			return nil, err
-		}
-		type check struct {
-			poLine, contractLine uuid.UUID
-			lineNo               int
-			ordered, accepted    decimal.Decimal
-		}
-		var checks []check
-		for rows.Next() {
-			var ch check
-			var o, a string
-			if err := rows.Scan(&ch.poLine, &ch.contractLine, &ch.lineNo, &o, &a); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			ch.ordered, ch.accepted = decimalx.MustParse(o), decimalx.MustParse(a)
-			checks = append(checks, ch)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
-		lineIDs := make([]uuid.UUID, 0, len(checks))
-		for _, ch := range checks {
-			lineIDs = append(lineIDs, ch.contractLine)
-			var already string
-			if err := tx.QueryRow(ctx, `SELECT po_line_received($1)::text`, ch.poLine).Scan(&already); err != nil {
-				return nil, err
-			}
-			if decimalx.MustParse(already).Add(ch.accepted).GreaterThan(ch.ordered) {
-				return nil, apperrors.Rule("receipt_exceeds_ordered", "Accepted goods would exceed the quantity ordered on this purchase order line.",
-					map[string]any{"line_no": ch.lineNo, "ordered": ch.ordered.String(), "already_received": already, "accepted": ch.accepted.String()})
-			}
-		}
-		if _, err := tx.Exec(ctx, `UPDATE goods_receipts SET status = 'confirmed', confirmed_at = now(), confirmed_by = $2, version = version + 1, updated_at = now()
-			WHERE id = $1`, id, p.UserID); err != nil {
-			return nil, err
-		}
-		if err := touchLines(ctx, tx, lineIDs); err != nil {
-			return nil, err
-		}
-		if err := audit.Record(ctx, tx, "confirm", "goods_receipt", id, map[string]any{"status": []string{"draft", "confirmed"}}); err != nil {
+		if err := confirmGRTx(ctx, tx, id, p.UserID); err != nil {
 			return nil, err
 		}
 		return loadGR(ctx, tx, id, p)
 	})
+}
+
+// confirmGRTx confirms a locked draft receipt: accepted goods may not exceed what was ordered
+// (O-02 over-receipt threshold not yet decided: refuse).
+func confirmGRTx(ctx context.Context, tx pgx.Tx, id, actor uuid.UUID) error {
+	rows, err := tx.Query(ctx, `SELECT pol.id, pol.contract_line_id, cl.line_no, (pol.quantity-pol.cancelled_quantity)::text, grl.accepted_quantity::text
+		FROM purchase_order_lines pol JOIN goods_receipt_lines grl ON grl.purchase_order_line_id = pol.id AND grl.goods_receipt_id = $1
+		JOIN contract_lines cl ON cl.id = pol.contract_line_id
+		ORDER BY pol.id FOR UPDATE OF pol`, id)
+	if err != nil {
+		return err
+	}
+	type check struct {
+		poLine, contractLine uuid.UUID
+		lineNo               int
+		ordered, accepted    decimal.Decimal
+	}
+	var checks []check
+	for rows.Next() {
+		var ch check
+		var o, a string
+		if err := rows.Scan(&ch.poLine, &ch.contractLine, &ch.lineNo, &o, &a); err != nil {
+			rows.Close()
+			return err
+		}
+		ch.ordered, ch.accepted = decimalx.MustParse(o), decimalx.MustParse(a)
+		checks = append(checks, ch)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	lineIDs := make([]uuid.UUID, 0, len(checks))
+	for _, ch := range checks {
+		lineIDs = append(lineIDs, ch.contractLine)
+		var already string
+		if err := tx.QueryRow(ctx, `SELECT po_line_received($1)::text`, ch.poLine).Scan(&already); err != nil {
+			return err
+		}
+		if decimalx.MustParse(already).Add(ch.accepted).GreaterThan(ch.ordered) {
+			return apperrors.Rule("receipt_exceeds_ordered", "Accepted goods would exceed the quantity ordered on this purchase order line.",
+				map[string]any{"line_no": ch.lineNo, "ordered": ch.ordered.String(), "already_received": already, "accepted": ch.accepted.String()})
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE goods_receipts SET status = 'confirmed', confirmed_at = now(), confirmed_by = $2, version = version + 1, updated_at = now()
+		WHERE id = $1`, id, actor); err != nil {
+		return err
+	}
+	if err := touchLines(ctx, tx, lineIDs); err != nil {
+		return err
+	}
+	if err := audit.Record(ctx, tx, "confirm", "goods_receipt", id, map[string]any{"status": []string{"draft", "confirmed"}}); err != nil {
+		return err
+	}
+	return nil
 }
 
 // DeliveryOrder is a planned (draft) or confirmed delivery to the customer.
@@ -248,6 +270,7 @@ type DeliveryOrder struct {
 	DeliveredOn *string       `json:"delivered_on"`
 	Lines       []DOLine      `json:"lines"`
 	Override    *OverrideInfo `json:"override"`
+	Version     int64         `json:"version"`
 }
 
 // DOLine is a quantity of one contract line.
@@ -260,9 +283,9 @@ type DOLine struct {
 func loadDO(ctx context.Context, q db.Querier, id uuid.UUID, p *access.Principal) (*DeliveryOrder, error) {
 	var d DeliveryOrder
 	var planned, delivered *time.Time
-	err := q.QueryRow(ctx, `SELECT d.id, d.number, d.contract_id, d.status, d.planned_on, d.firmness, d.route, d.delivered_on
+	err := q.QueryRow(ctx, `SELECT d.id, d.number, d.contract_id, d.status, d.planned_on, d.firmness, d.route, d.delivered_on, d.version
 		FROM delivery_orders d JOIN contracts c ON c.id = d.contract_id WHERE d.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2)`,
-		id, p.OwnerFilter()).Scan(&d.ID, &d.Number, &d.ContractID, &d.Status, &planned, &d.Firmness, &d.Route, &delivered)
+		id, p.OwnerFilter()).Scan(&d.ID, &d.Number, &d.ContractID, &d.Status, &planned, &d.Firmness, &d.Route, &delivered, &d.Version)
 	if err != nil {
 		return nil, err
 	}
@@ -295,26 +318,23 @@ type doLineInput struct {
 }
 
 type doInput struct {
+	Version   *int64        `json:"version"` // editing a draft: the version it was read at
 	PlannedOn *string       `json:"planned_on"`
 	Firmness  string        `json:"firmness"`
 	Route     string        `json:"route"`
 	Lines     []doLineInput `json:"lines"`
+	// OverContract plans beyond the unplanned quantity on purpose; confirming such a delivery
+	// still needs an approved Admin override (BR-05).
+	OverContract bool `json:"over_contract"`
 }
 
-// CreateDeliveryOrder handles POST /contracts/:id/delivery-orders: a planned
-// delivery with a tentative or firm date (never silently promoted to firm).
-func (h *Handlers) CreateDeliveryOrder(c *gin.Context) {
-	p := auth.Principal(c)
-	contractID, err := httpx.PathID(c, "id")
-	if err != nil {
-		response.Fail(c, err)
-		return
-	}
-	var in doInput
-	if err := httpx.Decode(c, &in); err != nil {
-		response.Fail(c, err)
-		return
-	}
+type doLine struct {
+	contractLine uuid.UUID
+	qty          decimal.Decimal
+}
+
+// parse validates a delivery plan's fields; it is shared by create and edit.
+func (in *doInput) parse() (*time.Time, []doLine, error) {
 	var errs apperrors.FieldErrors
 	planned := httpx.Date(&errs, "planned_on", in.PlannedOn)
 	if in.Firmness == "" {
@@ -335,21 +355,72 @@ func (h *Handlers) CreateDeliveryOrder(c *gin.Context) {
 	if len(in.Lines) == 0 {
 		errs.Add("lines", "required", map[string]any{"min": 1})
 	}
-	type line struct {
-		contractLine uuid.UUID
-		qty          decimal.Decimal
-	}
-	lines := make([]line, len(in.Lines))
+	lines := make([]doLine, len(in.Lines))
 	seen := map[uuid.UUID]bool{}
 	for i, l := range in.Lines {
 		f := func(n string) string { return fmt.Sprintf("lines[%d].%s", i, n) }
-		lines[i] = line{contractLine: httpx.UUID(&errs, f("contract_line_id"), l.ContractLineID), qty: decimalx.Positive(&errs, f("quantity"), l.Quantity)}
+		lines[i] = doLine{contractLine: httpx.UUID(&errs, f("contract_line_id"), l.ContractLineID), qty: decimalx.Positive(&errs, f("quantity"), l.Quantity)}
 		if seen[lines[i].contractLine] {
 			errs.Add(f("contract_line_id"), "duplicate", nil)
 		}
 		seen[lines[i].contractLine] = true
 	}
-	if err := errs.Err(); err != nil {
+	return planned, lines, errs.Err()
+}
+
+// checkPlanLines refuses service lines and, unless overContract, plans beyond what is still
+// unplanned: the (amended) contract quantity minus deliveries and other open plans. except is
+// the delivery being edited, whose own lines are not counted as "other plans".
+func checkPlanLines(ctx context.Context, tx pgx.Tx, contractID uuid.UUID, lines []doLine, except *uuid.UUID, overContract bool) error {
+	for i, l := range lines {
+		var service bool
+		var free string
+		if err := tx.QueryRow(ctx, `SELECT cl.line_type = 'service',
+				(cl.quantity - line_delivered(cl.id) - coalesce((SELECT sum(dol.quantity) FROM delivery_order_lines dol JOIN delivery_orders d ON d.id = dol.delivery_order_id
+					WHERE dol.contract_line_id = cl.id AND d.status = 'draft' AND ($3::uuid IS NULL OR d.id <> $3)), 0))::text
+			FROM contract_lines cl WHERE cl.id = $1 AND cl.contract_id = $2`, l.contractLine, contractID, except).Scan(&service, &free); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return apperrors.Invalid(fmt.Sprintf("lines[%d].contract_line_id", i), "not_in_contract", nil)
+			}
+			return err
+		}
+		if service {
+			return apperrors.Invalid(fmt.Sprintf("lines[%d].contract_line_id", i), "service_line", nil)
+		}
+		if max := decimal.Max(decimalx.MustParse(free), decimal.Zero); !overContract && l.qty.GreaterThan(max) {
+			return apperrors.Invalid(fmt.Sprintf("lines[%d].quantity", i), "exceeds_unplanned", map[string]any{"max": max.String()})
+		}
+	}
+	return nil
+}
+
+func insertDOLines(ctx context.Context, tx pgx.Tx, id, contractID uuid.UUID, lines []doLine) error {
+	for _, l := range lines {
+		// The composite FK refuses a line of another contract (AC-03 for deliveries).
+		if _, err := tx.Exec(ctx, `INSERT INTO delivery_order_lines (delivery_order_id, contract_id, contract_line_id, quantity) VALUES ($1, $2, $3, $4)`,
+			id, contractID, l.contractLine, l.qty); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CreateDeliveryOrder handles POST /contracts/:id/delivery-orders: a planned
+// delivery with a tentative or firm date (never silently promoted to firm).
+func (h *Handlers) CreateDeliveryOrder(c *gin.Context) {
+	p := auth.Principal(c)
+	contractID, err := httpx.PathID(c, "id")
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	var in doInput
+	if err := httpx.Decode(c, &in); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	planned, lines, err := in.parse()
+	if err != nil {
 		response.Fail(c, err)
 		return
 	}
@@ -362,15 +433,8 @@ func (h *Handlers) CreateDeliveryOrder(c *gin.Context) {
 		if k.Status != "active" {
 			return nil, apperrors.Rule("contract_not_active", "Activate the contract before planning deliveries.", map[string]any{"status": k.Status})
 		}
-		// Services are done by service visits, never delivered.
-		for i, l := range lines {
-			var service bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM contract_lines WHERE id = $1 AND line_type = 'service')`, l.contractLine).Scan(&service); err != nil {
-				return nil, err
-			}
-			if service {
-				return nil, apperrors.Invalid(fmt.Sprintf("lines[%d].contract_line_id", i), "service_line", nil)
-			}
+		if err := checkPlanLines(ctx, tx, contractID, lines, nil, in.OverContract); err != nil {
+			return nil, err
 		}
 		number, err := numbering.NextChild(ctx, tx, contractID, "DO")
 		if err != nil {
@@ -381,15 +445,82 @@ func (h *Handlers) CreateDeliveryOrder(c *gin.Context) {
 			VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`, contractID, number, planned, in.Firmness, in.Route, p.UserID).Scan(&id); err != nil {
 			return nil, err
 		}
-		for _, l := range lines {
-			// The composite FK refuses a line of another contract (AC-03 for deliveries).
-			if _, err := tx.Exec(ctx, `INSERT INTO delivery_order_lines (delivery_order_id, contract_id, contract_line_id, quantity) VALUES ($1, $2, $3, $4)`,
-				id, contractID, l.contractLine, l.qty); err != nil {
-				return nil, err
-			}
+		if err := insertDOLines(ctx, tx, id, contractID, lines); err != nil {
+			return nil, err
 		}
 		if err := audit.Record(ctx, tx, "create", "delivery_order", id, map[string]any{"number": number, "contract_id": contractID,
 			"planned_on": dateString(planned), "firmness": in.Firmness, "route": in.Route, "lines": len(lines)}); err != nil {
+			return nil, err
+		}
+		return loadDO(ctx, tx, id, p)
+	})
+}
+
+// UpdateDeliveryOrder handles PATCH /delivery-orders/:id: a planned (draft) delivery's date,
+// firmness, route and lines change in place instead of cancelling and planning again.
+func (h *Handlers) UpdateDeliveryOrder(c *gin.Context) {
+	p := auth.Principal(c)
+	id, err := httpx.PathID(c, "id")
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	var in doInput
+	if err := httpx.Decode(c, &in); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	planned, lines, err := in.parse()
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	httpx.Command(c, h.Pool, "delivery_orders.update", false, 200, func(tx pgx.Tx) (any, error) {
+		ctx := c.Request.Context()
+		var contractID uuid.UUID
+		if err := tx.QueryRow(ctx, `SELECT d.contract_id FROM delivery_orders d JOIN contracts c ON c.id = d.contract_id
+			WHERE d.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2)`, id, p.OwnerFilter()).Scan(&contractID); err != nil {
+			return nil, err
+		}
+		k, err := lockContract(ctx, tx, contractID, p, false)
+		if err != nil {
+			return nil, err
+		}
+		if k.Status != "active" {
+			return nil, apperrors.Rule("contract_not_active", "Activate the contract before planning deliveries.", map[string]any{"status": k.Status})
+		}
+		var status string
+		var version int64
+		var pending bool
+		if err := tx.QueryRow(ctx, `SELECT d.status, d.version, EXISTS (SELECT 1 FROM quantity_override_requests r WHERE r.kind = 'delivery_order' AND r.document_id = d.id AND r.status IN ('pending', 'approved'))
+			FROM delivery_orders d WHERE d.id = $1 FOR UPDATE`, id).Scan(&status, &version, &pending); err != nil {
+			return nil, err
+		}
+		if status != "draft" {
+			return nil, apperrors.Rule("document_not_draft", "Only a planned delivery can be changed.", map[string]any{"status": status})
+		}
+		if pending {
+			// An approval covers the quantities it was asked for; a pending request is still being decided.
+			return nil, apperrors.Rule("override_exists", "This delivery has an over-quantity request. Cancel it and plan again to change the quantities.", nil)
+		}
+		if in.Version != nil && *in.Version != version {
+			return nil, apperrors.Conflict("version_conflict", "This delivery changed. Reload it before saving.", nil)
+		}
+		if err := checkPlanLines(ctx, tx, contractID, lines, &id, in.OverContract); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE delivery_orders SET planned_on = $2, firmness = $3, route = $4, version = version + 1, updated_at = now() WHERE id = $1`,
+			id, planned, in.Firmness, in.Route); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM delivery_order_lines WHERE delivery_order_id = $1`, id); err != nil {
+			return nil, err
+		}
+		if err := insertDOLines(ctx, tx, id, contractID, lines); err != nil {
+			return nil, err
+		}
+		if err := audit.Record(ctx, tx, "update", "delivery_order", id, map[string]any{"planned_on": dateString(planned), "firmness": in.Firmness,
+			"route": in.Route, "lines": len(lines)}); err != nil {
 			return nil, err
 		}
 		return loadDO(ctx, tx, id, p)

@@ -28,6 +28,15 @@ func parse(errs *apperrors.FieldErrors, field, raw string, strictlyPositive bool
 		return decimal.Zero
 	}
 	if !plain.MatchString(raw) {
+		if len(raw) > 1 && raw[0] == '-' && plain.MatchString(raw[1:]) {
+			// A negative number is well formed but out of range: say so, not "wrong format".
+			if strictlyPositive {
+				errs.Add(field, "greater_than", map[string]any{"min": "0"})
+			} else {
+				errs.Add(field, "not_negative", nil)
+			}
+			return decimal.Zero
+		}
 		errs.Add(field, "decimal", map[string]any{"max_scale": 6})
 		return decimal.Zero
 	}
@@ -49,4 +58,38 @@ func MustParse(s string) decimal.Decimal {
 		panic("decimalx: database returned non-decimal " + s)
 	}
 	return d
+}
+
+// MoneyScale is the number of decimals money is kept to in a currency: whole đồng for VND, cents otherwise.
+func MoneyScale(currency string) int32 {
+	if currency == "VND" {
+		return 0
+	}
+	return 2
+}
+
+// RoundMoney rounds an amount to the currency's smallest unit.
+func RoundMoney(d decimal.Decimal, currency string) decimal.Decimal {
+	return d.Round(MoneyScale(currency))
+}
+
+// MoneyUnit is the currency's smallest unit (1 for VND, 0.01 otherwise), the rounding tolerance.
+func MoneyUnit(currency string) decimal.Decimal {
+	return decimal.New(1, -MoneyScale(currency))
+}
+
+// CheckMoney refuses an amount with more decimals than the currency has (a VND amount is whole
+// đồng), instead of silently rounding what the person typed.
+func CheckMoney(errs *apperrors.FieldErrors, field string, d decimal.Decimal, currency string) {
+	if !d.Equal(RoundMoney(d, currency)) {
+		errs.Add(field, MoneyScaleCode(currency), map[string]any{"max_scale": MoneyScale(currency), "currency": currency})
+	}
+}
+
+// MoneyScaleCode names the error for too many decimals: "whole_amount" when the currency has none.
+func MoneyScaleCode(currency string) string {
+	if MoneyScale(currency) == 0 {
+		return "whole_amount"
+	}
+	return "decimal"
 }

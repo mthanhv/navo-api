@@ -198,7 +198,7 @@ func (h *Handlers) prepare(ctx context.Context, q db.Querier, owner *uuid.UUID, 
 		rows, err := q.Query(ctx, `SELECT ct.id, ct.organization_id, ct.full_name, ct.email
 			FROM contacts ct JOIN organizations o ON o.id = ct.organization_id
 			WHERE ct.id = ANY($1) AND (o.is_customer OR o.lead_stage IS NOT NULL) AND ct.email IS NOT NULL AND ct.accepts_email AND `+Manageable(2)+`
-			ORDER BY o.name, ct.full_name, ct.id`, contactIDs, owner)
+			ORDER BY vn_fold(o.name), o.name, ct.full_name, ct.id`, contactIDs, owner)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -325,11 +325,19 @@ func (h *Handlers) deliver(id uuid.UUID, senderName, senderEmail string) {
 	var list []rcpt
 	for rows.Next() {
 		var r rcpt
-		if err := rows.Scan(&r.id, &r.name, &r.email); err == nil {
-			list = append(list, r)
+		if err := rows.Scan(&r.id, &r.name, &r.email); err != nil {
+			rows.Close()
+			slog.Error("mailing recipients failed", "mailing_id", id, "error", err)
+			return
 		}
+		list = append(list, r)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		// A partial list would silently skip people; leave the rest queued for the next run.
+		slog.Error("mailing recipients failed", "mailing_id", id, "error", err)
+		return
+	}
 	for _, r := range list {
 		tag, err := h.Pool.Exec(ctx, `UPDATE mailing_recipients SET status='sending' WHERE id=$1 AND status='queued'`, r.id)
 		if err != nil {
@@ -429,7 +437,7 @@ func (h *Handlers) loadMailing(ctx context.Context, q db.Querier, id uuid.UUID, 
 		return nil, err
 	}
 	rows, err := q.Query(ctx, `SELECT r.id, r.contact_id, r.organization_id, o.name, r.full_name, r.email, r.status, r.error, r.sent_at
-		FROM mailing_recipients r JOIN organizations o ON o.id = r.organization_id WHERE r.mailing_id = $1 ORDER BY o.name, r.full_name, r.id`, id)
+		FROM mailing_recipients r JOIN organizations o ON o.id = r.organization_id WHERE r.mailing_id = $1 ORDER BY vn_fold(o.name), o.name, r.full_name, r.id`, id)
 	if err != nil {
 		return nil, err
 	}
