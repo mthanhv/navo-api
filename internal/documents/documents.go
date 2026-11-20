@@ -81,6 +81,13 @@ func resolveOwner(ctx context.Context, q db.Querier, p *access.Principal, ownerT
 	case OwnerSalesInvoice:
 		sql = `SELECT c.customer_id, cu.code, c.id, d.number FROM sales_invoices d JOIN contracts c ON c.id = d.contract_id JOIN organizations cu ON cu.id = c.customer_id
 			WHERE d.id = $1 AND ($2::uuid IS NULL OR c.owner_id = $2)`
+	case OwnerQuotation:
+		// Quotations are sales work: their files follow the quotation's PIC scope.
+		if !p.Can(access.ContractsWrite) {
+			return nil, apperrors.NotFound()
+		}
+		sql = `SELECT q.customer_id, cu.code, NULL::uuid, q.number FROM quotations q JOIN organizations cu ON cu.id = q.customer_id
+			WHERE q.id = $1 AND ($2::uuid IS NULL OR q.owner_id = $2)`
 	case OwnerNote:
 		// Notes: the author, whoever owns the note's contract, and people who see everyone.
 		sql = `SELECT n.customer_id, cu.code, n.contract_id, 'note' FROM notes n JOIN organizations cu ON cu.id = n.customer_id
@@ -344,6 +351,44 @@ func (h *Handlers) visibleLinks(ctx context.Context, p *access.Principal, where 
 		out = append(out, l.FileItem)
 	}
 	return out, nil
+}
+
+// OwnerFiles handles GET /files?owner_type=&owner_id=: the files of one record, and the
+// document kinds the caller may attach to that type of record. Without owner_id only the
+// kinds are returned (forms for records not saved yet).
+func (h *Handlers) OwnerFiles(c *gin.Context) {
+	ctx := c.Request.Context()
+	p := auth.Principal(c)
+	ownerType := c.Query("owner_type")
+	kinds := []string{}
+	for _, k := range KindsFor(ownerType) {
+		if Visible(p, ownerType, k) {
+			kinds = append(kinds, k)
+		}
+	}
+	if len(kinds) == 0 {
+		response.Fail(c, apperrors.Invalid("owner_type", "one_of", nil))
+		return
+	}
+	items := []FileItem{}
+	if raw := c.Query("owner_id"); raw != "" {
+		var errs apperrors.FieldErrors
+		id := httpx.UUID(&errs, "owner_id", raw)
+		if err := errs.Err(); err != nil {
+			response.Fail(c, err)
+			return
+		}
+		if _, err := resolveOwner(ctx, h.Pool, p, ownerType, id); err != nil {
+			response.Fail(c, err)
+			return
+		}
+		var err error
+		if items, err = h.visibleLinks(ctx, p, `l.owner_type = $1 AND l.owner_id = $2`, ownerType, id); err != nil {
+			response.Fail(c, err)
+			return
+		}
+	}
+	response.OK(c, gin.H{"items": items, "kinds": kinds, "can_write": canWriteFiles(p), "max_mb": MaxUpload >> 20})
 }
 
 // Download handles GET /files/:id?link=: the bytes of a file the caller may see through

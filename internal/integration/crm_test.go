@@ -10,7 +10,7 @@ func TestNotesAndTasks(t *testing.T) {
 	e := setup(t)
 	e.user("khoa@test.vn", []string{"sales"})
 	e.user("ha@test.vn", []string{"sales"})
-	e.user("lan@test.vn", []string{"leader"})
+	e.user("lan@test.vn", []string{"delivery"})
 	khoa, ha, lan := e.login("khoa@test.vn"), e.login("ha@test.vn"), e.login("lan@test.vn")
 	cust := e.must(201, e.do(khoa, "POST", "/api/v1/organizations", map[string]any{"code": "DPN", "name": "Đạm Phương Nam", "is_customer": true}, nil), "c")
 	note := map[string]any{"client_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7", "customer_id": cust["id"], "body": "Anh Huy cần báo giá 6 van DN80",
@@ -39,7 +39,7 @@ func TestNotesAndTasks(t *testing.T) {
 		t.Fatalf("other sales do not see the note: %d", n)
 	}
 	if n := len(e.do(lan, "GET", "/api/v1/notes?customer_id="+cust["id"].(string), nil, nil).Body["data"].([]any)); n != 1 {
-		t.Fatalf("leaders see notes: %d", n)
+		t.Fatalf("whole-company roles see notes: %d", n)
 	}
 	if r := e.do(khoa, "POST", "/api/v1/ai/note-parse", map[string]any{"text": "x"}, nil); r.reason() != "ai_disabled" {
 		t.Fatalf("AI off without a key: %v", r.Body)

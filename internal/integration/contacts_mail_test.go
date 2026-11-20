@@ -38,7 +38,7 @@ func TestContactsAndProductEmails(t *testing.T) {
 	e := setup(t)
 	e.user("khoa@test.vn", []string{"sales"})
 	e.user("ha@test.vn", []string{"sales"})
-	e.user("lan@test.vn", []string{"leader"})
+	e.user("lan@test.vn", []string{"delivery"})
 	khoa, ha, lan := e.login("khoa@test.vn"), e.login("ha@test.vn"), e.login("lan@test.vn")
 	cust := e.must(201, e.do(khoa, "POST", "/api/v1/organizations", map[string]any{"code": "DPN", "name": "Đạm Phương Nam", "is_customer": true}, nil), "customer")["id"].(string)
 	supp := e.must(201, e.do(khoa, "POST", "/api/v1/organizations", map[string]any{"code": "DA", "name": "Thiết bị Đông Á", "is_supplier": true}, nil), "supplier")["id"].(string)
@@ -126,8 +126,8 @@ func TestContactsAndProductEmails(t *testing.T) {
 	if r := e.do(ha, "GET", "/api/v1/mailings/"+id, nil, nil); r.Status != 404 {
 		t.Fatalf("another salesperson does not see it: %d", r.Status)
 	}
-	if l := e.must(200, e.do(lan, "GET", "/api/v1/mailings", nil, nil), "leader list")["items"].([]any); len(l) != 1 {
-		t.Fatalf("leaders see all mailings: %v", l)
+	if l := e.must(200, e.do(lan, "GET", "/api/v1/mailings", nil, nil), "whole-company list")["items"].([]any); len(l) != 1 {
+		t.Fatalf("whole-company roles see all mailings: %v", l)
 	}
 	// Deleting a contact keeps the record of what was sent.
 	e.must(200, e.do(khoa, "DELETE", "/api/v1/contacts/"+huy["id"].(string), nil, nil), "delete sent contact")

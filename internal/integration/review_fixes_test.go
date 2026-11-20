@@ -76,7 +76,7 @@ func TestContactOwnership(t *testing.T) {
 	e := setup(t)
 	e.user("khoa@test.vn", []string{"sales"})
 	e.user("ha@test.vn", []string{"sales"})
-	e.user("lan@test.vn", []string{"leader"})
+	e.user("lan@test.vn", []string{"admin"})
 	e.user("mai@test.vn", []string{"accounting"})
 	e.user("nam@test.vn", []string{"admin"})
 	khoa, ha, lan, mai, nam := e.login("khoa@test.vn"), e.login("ha@test.vn"), e.login("lan@test.vn"), e.login("mai@test.vn"), e.login("nam@test.vn")
@@ -121,8 +121,8 @@ func TestContactOwnership(t *testing.T) {
 		t.Fatalf("accounting reads but does not write contacts: %d", r.Status)
 	}
 
-	// Leaders and admin manage any customer; suppliers are shared.
-	e.must(200, e.do(lan, "PATCH", "/api/v1/contacts/"+huy, map[string]any{"full_name": "Trần Quốc Huy", "email": "huy@stra.vn"}, nil), "leader edits")
+	// Admins manage any customer; suppliers are shared.
+	e.must(200, e.do(lan, "PATCH", "/api/v1/contacts/"+huy, map[string]any{"full_name": "Trần Quốc Huy", "email": "huy@stra.vn"}, nil), "another admin edits")
 	e.must(201, e.do(nam, "POST", "/api/v1/organizations/"+cid+"/contacts", map[string]any{"full_name": "Lê Mai", "email": "mai@stra.vn"}, nil), "admin adds")
 	e.must(201, e.do(ha, "POST", "/api/v1/organizations/"+supp+"/contacts", map[string]any{"full_name": "Mr Kim"}, nil), "supplier contacts are shared")
 
@@ -162,7 +162,7 @@ func TestContractHistory(t *testing.T) {
 	e := setup(t)
 	e.user("khoa@test.vn", []string{"sales"})
 	e.user("ha@test.vn", []string{"sales"})
-	e.user("lan@test.vn", []string{"leader"})
+	e.user("lan@test.vn", []string{"delivery"})
 	khoa, ha, lan := e.login("khoa@test.vn"), e.login("ha@test.vn"), e.login("lan@test.vn")
 	f := e.activeContract(khoa, "HIS", "10")
 	po := e.must(201, e.do(khoa, "POST", "/api/v1/contracts/"+f.contract+"/purchase-orders", map[string]any{"supplier_id": f.supplier, "currency": "VND",
@@ -495,7 +495,7 @@ func (e *env) importFile(token, kind, step, name string, content []byte, hash st
 func TestMasterDataImport(t *testing.T) {
 	e := setup(t)
 	e.user("khoa@test.vn", []string{"sales"})
-	e.user("lan@test.vn", []string{"leader"})
+	e.user("lan@test.vn", []string{"delivery"})
 	khoa, lan := e.login("khoa@test.vn"), e.login("lan@test.vn")
 	e.must(201, e.do(khoa, "POST", "/api/v1/organizations", map[string]any{"code": "STRA", "name": "Lọc hóa dầu Sông Trà", "is_customer": true, "tax_code": "0101234567"}, nil), "existing")
 	csv := []byte("Mã;Tên;Mã số thuế;Khách hàng;Nhà cung cấp;Người liên hệ;Email\n" +
@@ -506,7 +506,7 @@ func TestMasterDataImport(t *testing.T) {
 		"DPN;Trùng mã;;x;;;\n" + // error: duplicate code in file
 		"DA;Thiết bị Đông Á;;;x;Mr Kim;not-an-email\n") // error: email
 	if r := e.importFile(lan, "partners", "preview", "p.csv", csv, ""); r.Status != 403 {
-		t.Fatalf("leaders do not import: %d", r.Status)
+		t.Fatalf("delivery does not import: %d", r.Status)
 	}
 	pv := e.importFile(khoa, "partners", "preview", "p.csv", csv, "")
 	if pv.Status != 200 {

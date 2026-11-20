@@ -46,6 +46,8 @@ type Contract struct {
 	FinalDueOn *string   `json:"final_due_on"`
 	Lines      []LineRow `json:"lines,omitempty"`
 	Summary    *Summary  `json:"summary,omitempty"`
+	// Detail view only: the quotation this contract was won from, if any.
+	Quotation *QuotationRef `json:"quotation,omitempty"`
 	// List view only (active contracts): delivery progress and what needs attention.
 	Progress  *Summary           `json:"progress,omitempty"`
 	Attention *ContractAttention `json:"attention,omitempty"`
@@ -89,7 +91,22 @@ func (h *Handlers) loadContract(ctx context.Context, q db.Querier, id uuid.UUID,
 	}
 	s := summarize(k.Lines)
 	k.Summary = &s
+	var ref QuotationRef
+	switch err := q.QueryRow(ctx, `SELECT id, number, revision FROM quotations WHERE contract_id=$1`, id).Scan(&ref.ID, &ref.Number, &ref.Revision); err {
+	case nil:
+		k.Quotation = &ref
+	case pgx.ErrNoRows:
+	default:
+		return nil, err
+	}
 	return &k, nil
+}
+
+// QuotationRef names the quotation a contract came from.
+type QuotationRef struct {
+	ID       uuid.UUID `json:"id"`
+	Number   string    `json:"number"`
+	Revision int       `json:"revision"`
 }
 
 type contractLineInput struct {
@@ -112,6 +129,8 @@ type contractInput struct {
 	OwnerID           *string             `json:"owner_id"`
 	Lines             []contractLineInput `json:"lines"`
 	Milestones        []finance.DraftTerm `json:"milestones"`
+	// QuotationID: the contract is created from this quotation, which becomes won.
+	QuotationID *string `json:"quotation_id,omitempty"`
 }
 
 type parsedLine struct {
@@ -177,6 +196,11 @@ func (h *Handlers) saveContract(c *gin.Context, editing bool) {
 	}
 	if len(in.Lines) == 0 {
 		errs.Add("lines", "required", map[string]any{"min": 1})
+	}
+	var quotationID *uuid.UUID
+	if !editing && in.QuotationID != nil && *in.QuotationID != "" {
+		qid := httpx.UUID(&errs, "quotation_id", *in.QuotationID)
+		quotationID = &qid
 	}
 	lines := make([]parsedLine, len(in.Lines))
 	for i, l := range in.Lines {
@@ -315,6 +339,11 @@ func (h *Handlers) saveContract(c *gin.Context, editing bool) {
 		}
 		if err := finance.CreateDraftTerms(ctx, tx, id, p.UserID, in.Milestones); err != nil {
 			return nil, err
+		}
+		if quotationID != nil {
+			if err := winQuotation(ctx, tx, p, *quotationID, id, customerID); err != nil {
+				return nil, err
+			}
 		}
 		action := "create"
 		if editing {

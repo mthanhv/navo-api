@@ -1,6 +1,7 @@
 // Package access defines roles, permissions and data scope (TECHNICAL_DESIGN 5.2).
 // Admin holds every permission and sees the whole company (owner decision, 2026-11-10;
-// before that admin was kept away from business and finance data).
+// before that admin was kept away from business and finance data). The leader role was
+// removed and a delivery role added on 2026-11-20 (migration 018 made leaders admins).
 package access
 
 import "github.com/google/uuid"
@@ -10,7 +11,7 @@ type Role string
 
 const (
 	Sales      Role = "sales"
-	Leader     Role = "leader"
+	Delivery   Role = "delivery"
 	Accounting Role = "accounting"
 	Admin      Role = "admin"
 )
@@ -18,7 +19,7 @@ const (
 // ValidRole reports whether r is a known role.
 func ValidRole(r string) bool {
 	switch Role(r) {
-	case Sales, Leader, Accounting, Admin:
+	case Sales, Delivery, Accounting, Admin:
 		return true
 	}
 	return false
@@ -52,8 +53,9 @@ const (
 var Grantable = map[Permission]bool{PurchaseCostRead: true, FinanceRead: true, QuantityOverride: true, FulfillmentConfirm: true}
 
 var roleDefaults = map[Role][]Permission{
-	Sales:      {ContractsRead, ContractsWrite, ProcurementWrite, FulfillmentWrite, FulfillmentConfirm, PartnersWrite, ContactsWrite, CatalogWrite, ReportsOperations},
-	Leader:     {ContractsRead, ReportsOperations, ContactsWrite},
+	Sales: {ContractsRead, ContractsWrite, ProcurementWrite, FulfillmentWrite, FulfillmentConfirm, PartnersWrite, ContactsWrite, CatalogWrite, ReportsOperations},
+	// Delivery receives goods and delivers to customers on every contract; no contract edits, ordering, prices or finance.
+	Delivery:   {ContractsRead, FulfillmentWrite, FulfillmentConfirm, ReportsOperations},
 	Accounting: {ContractsRead, PurchaseCostRead, FinanceRead, FinanceWrite},
 	Admin:      all,
 }
@@ -85,8 +87,8 @@ func NewPrincipal(id uuid.UUID, name, email string, roles []Role, grants []strin
 		for _, perm := range roleDefaults[r] {
 			p.perms[perm] = true
 		}
-		// Leaders, accounting and admin read the whole company; sales read their own (REQUIREMENTS 2).
-		if r == Leader || r == Accounting || r == Admin {
+		// Delivery, accounting and admin read the whole company; sales read their own (REQUIREMENTS 2).
+		if r == Delivery || r == Accounting || r == Admin {
 			p.seesAll = true
 		}
 	}

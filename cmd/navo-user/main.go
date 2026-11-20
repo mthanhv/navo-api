@@ -21,7 +21,7 @@ import (
 func main() {
 	email := flag.String("email", "", "login email")
 	name := flag.String("name", "", "full name")
-	roles := flag.String("roles", "", "comma-separated roles: sales,leader,accounting,admin")
+	roles := flag.String("roles", "", "comma-separated roles: sales,delivery,accounting,admin")
 	grants := flag.String("grants", "", "comma-separated grants, e.g. purchase_cost.read,finance.read")
 	flag.Parse()
 

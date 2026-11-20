@@ -55,13 +55,19 @@ func trimOpt(s *string) *string {
 }
 
 func (in *contactInput) validate() error {
+	var errs apperrors.FieldErrors
+	in.check(&errs, "")
+	return errs.Err()
+}
+
+// check adds field errors under prefix (e.g. "contacts[0].") and normalises the input.
+func (in *contactInput) check(errs *apperrors.FieldErrors, prefix string) {
 	in.FullName = strings.TrimSpace(in.FullName)
 	in.JobTitle, in.Email, in.Phone, in.Note = trimOpt(in.JobTitle), trimOpt(in.Email), trimOpt(in.Phone), trimOpt(in.Note)
-	var errs apperrors.FieldErrors
 	if in.FullName == "" {
-		errs.Add("full_name", "required", nil)
+		errs.Add(prefix+"full_name", "required", nil)
 	} else if len([]rune(in.FullName)) > 200 {
-		errs.Add("full_name", "too_long", map[string]any{"max": 200})
+		errs.Add(prefix+"full_name", "too_long", map[string]any{"max": 200})
 	}
 	for _, f := range []struct {
 		name string
@@ -69,20 +75,53 @@ func (in *contactInput) validate() error {
 		max  int
 	}{{"job_title", in.JobTitle, 120}, {"phone", in.Phone, 40}, {"note", in.Note, 500}} {
 		if f.v != nil && len([]rune(*f.v)) > f.max {
-			errs.Add(f.name, "too_long", map[string]any{"max": f.max})
+			errs.Add(prefix+f.name, "too_long", map[string]any{"max": f.max})
 		}
 	}
 	if in.Email != nil {
 		a, err := mail.ParseAddress(*in.Email)
 		// A bare address only: no display name, no spaces, and a dot in the domain.
 		if err != nil || a.Address != *in.Email || len(*in.Email) > 254 || !strings.Contains((*in.Email)[strings.LastIndex(*in.Email, "@")+1:], ".") {
-			errs.Add("email", "email", nil)
+			errs.Add(prefix+"email", "email", nil)
 		} else {
 			lower := strings.ToLower(*in.Email)
 			in.Email = &lower
 		}
 	}
-	return errs.Err()
+}
+
+// NewContact is a contact given together with a new partner (add customer/supplier form).
+type NewContact = contactInput
+
+// CheckContacts validates contacts sent with a partner, as contacts[i].field errors.
+func CheckContacts(errs *apperrors.FieldErrors, list []NewContact) {
+	for i := range list {
+		list[i].check(errs, fmt.Sprintf("contacts[%d].", i))
+	}
+}
+
+// InsertContacts adds the contacts of a partner created in the same transaction. The one
+// marked main (or else the first) becomes the main contact.
+func InsertContacts(ctx context.Context, tx pgx.Tx, orgID uuid.UUID, list []NewContact) error {
+	main := 0
+	for i, in := range list {
+		if in.IsPrimary {
+			main = i
+			break
+		}
+	}
+	for i, in := range list {
+		accepts := in.AcceptsEmail == nil || *in.AcceptsEmail
+		var id uuid.UUID
+		if err := tx.QueryRow(ctx, `INSERT INTO contacts (organization_id, full_name, job_title, email, phone, note, is_primary, accepts_email)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`, orgID, in.FullName, in.JobTitle, in.Email, in.Phone, in.Note, i == main, accepts).Scan(&id); err != nil {
+			return contactWriteErr(err)
+		}
+		if err := audit.Record(ctx, tx, "create", "contact", id, map[string]any{"organization_id": orgID, "full_name": in.FullName, "is_primary": i == main}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 const contactSelect = `SELECT ct.id, ct.organization_id, o.name, ct.full_name, ct.job_title, ct.email, ct.phone, ct.note, ct.is_primary, ct.accepts_email

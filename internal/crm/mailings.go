@@ -412,7 +412,7 @@ func scanMailing(row pgx.Row, m *Mailing, extra ...any) error {
 }
 
 // loadMailing returns a mailing with products and recipients; owner limits it to the
-// writer's own (sales), nil shows any (leaders, accounting).
+// writer's own (sales), nil shows any (whole-company roles).
 func (h *Handlers) loadMailing(ctx context.Context, q db.Querier, id uuid.UUID, owner *uuid.UUID) (*Mailing, error) {
 	var m Mailing
 	if err := scanMailing(q.QueryRow(ctx, mailingSelect+` WHERE m.id = $1 AND ($2::uuid IS NULL OR m.created_by = $2)`, id, owner), &m); err != nil {

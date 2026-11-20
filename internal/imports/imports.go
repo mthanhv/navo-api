@@ -68,6 +68,17 @@ var templates = map[string][]column{
 		{"email", "Email", []string{"email", "e-mail"}, false},
 		{"phone", "Điện thoại (Phone)", []string{"dien thoai", "phone", "so dien thoai", "sdt"}, false},
 	},
+	// Item lines for a contract or quotation form: read and matched to the catalogue, never saved here.
+	"lines": {
+		{"product_code", "Mã hãng (Part number)", []string{"ma hang", "part number", "part no", "ma san pham", "ma", "code", "model"}, false},
+		{"name", "Tên hàng (Item)", []string{"ten hang", "ten hang hoa", "hang hoa", "ten", "item", "description", "dien giai", "ten san pham", "mo ta"}, true},
+		{"unit", "Đơn vị (Unit)", []string{"don vi", "dvt", "don vi tinh", "unit", "uom"}, false},
+		{"quantity", "Số lượng (Quantity)", []string{"so luong", "sl", "qty", "quantity"}, true},
+		{"unit_price", "Đơn giá (Unit price)", []string{"don gia", "unit price", "price", "gia"}, false},
+		{"vat", "VAT %", []string{"vat", "vat %", "thue", "thue suat", "thue vat", "tax"}, false},
+		{"due_on", "Hạn giao (Due date)", []string{"han giao", "ngay giao", "due date", "due", "delivery date"}, false},
+		{"lead_time", "Thời gian giao (Lead time)", []string{"thoi gian giao", "lead time", "tien do"}, false},
+	},
 	"products": {
 		{"name", "Tên sản phẩm (Name)", []string{"ten san pham", "ten hang", "ten", "name", "product"}, true},
 		{"unit", "Đơn vị (Unit)", []string{"don vi", "dvt", "don vi tinh", "unit"}, true},
@@ -151,7 +162,10 @@ func permissionFor(kind string) access.Permission {
 }
 
 // readFile returns the rows of the first sheet (xlsx) or the CSV, and the file's hash.
-func readFile(c *gin.Context) ([][]string, string, error) {
+func readFile(c *gin.Context) ([][]string, string, error) { return readFileAs(c, false) }
+
+// readFileAs reads raw cell values when raw is set (numbers unformatted, dates as serials).
+func readFileAs(c *gin.Context, raw bool) ([][]string, string, error) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes+1<<20)
 	fh, err := c.FormFile("file")
 	if err != nil {
@@ -165,24 +179,24 @@ func readFile(c *gin.Context) ([][]string, string, error) {
 		return nil, "", err
 	}
 	defer src.Close()
-	raw, err := io.ReadAll(src)
+	data, err := io.ReadAll(src)
 	if err != nil {
 		return nil, "", err
 	}
-	sum := sha256.Sum256(raw)
+	sum := sha256.Sum256(data)
 	hash := hex.EncodeToString(sum[:])
-	if bytes.HasPrefix(raw, []byte("PK")) {
-		f, err := excelize.OpenReader(bytes.NewReader(raw))
+	if bytes.HasPrefix(data, []byte("PK")) {
+		f, err := excelize.OpenReader(bytes.NewReader(data))
 		if err != nil {
 			return nil, "", apperrors.Invalid("file", "file_type", map[string]any{"type": "xlsx, csv"})
 		}
 		defer f.Close()
-		rows, err := f.GetRows(f.GetSheetName(0))
+		rows, err := f.GetRows(f.GetSheetName(0), excelize.Options{RawCellValue: raw})
 		return rows, hash, err
 	}
-	r := csv.NewReader(bytes.NewReader(bytes.TrimPrefix(raw, []byte("\xef\xbb\xbf"))))
+	r := csv.NewReader(bytes.NewReader(bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))))
 	r.FieldsPerRecord = -1
-	if bytes.Count(raw[:min(len(raw), 2000)], []byte(";")) > bytes.Count(raw[:min(len(raw), 2000)], []byte(",")) {
+	if bytes.Count(data[:min(len(data), 2000)], []byte(";")) > bytes.Count(data[:min(len(data), 2000)], []byte(",")) {
 		r.Comma = ';' // Excel in Vietnamese locale saves CSV with semicolons
 	}
 	rows, err := r.ReadAll()
@@ -452,7 +466,7 @@ func count(rows []Row) map[string]int {
 
 func (h *Handlers) load(c *gin.Context) (string, []Row, string, bool) {
 	kind := c.Param("kind")
-	if _, ok := templates[kind]; !ok {
+	if _, ok := templates[kind]; !ok || kind == "lines" {
 		response.Fail(c, apperrors.NotFound())
 		return "", nil, "", false
 	}

@@ -9,7 +9,7 @@ func TestListTabsFiltersAndSearch(t *testing.T) {
 	e := setup(t)
 	e.user("khoa@test.vn", []string{"sales"})
 	e.user("ha@test.vn", []string{"sales"})
-	e.user("lan@test.vn", []string{"leader"})
+	e.user("lan@test.vn", []string{"delivery"})
 	khoa, ha, lan := e.login("khoa@test.vn"), e.login("ha@test.vn"), e.login("lan@test.vn")
 
 	stra := e.must(201, e.do(khoa, "POST", "/api/v1/organizations", map[string]any{"code": "STRA", "name": "Sông Trà", "is_customer": true}, nil), "c1")
@@ -49,7 +49,7 @@ func TestListTabsFiltersAndSearch(t *testing.T) {
 	_ = owners
 	lines := e.must(200, e.do(lan, "GET", "/api/v1/reports/contract-lines?tab=action", nil, nil), "lines")
 	if lines["counts"].(map[string]any)["all"].(float64) != 2 || lines["pagination"].(map[string]any)["total"].(float64) != 2 {
-		t.Fatalf("leader line tabs: %v", lines["counts"])
+		t.Fatalf("whole-company line tabs: %v", lines["counts"])
 	}
 	if e.must(200, e.do(lan, "GET", "/api/v1/reports/contract-lines?tab=soon", nil, nil), "soon")["pagination"].(map[string]any)["total"].(float64) != 0 {
 		t.Fatal("nothing planned in 7 days")

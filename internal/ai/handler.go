@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"sort"
@@ -120,31 +121,17 @@ func (h *Handlers) ContractDraft(c *gin.Context) {
 	}
 
 	// Products: an exact name is a match; similar names are offered as choices.
-	rows, err := h.Pool.Query(ctx, `SELECT id, name, manufacturer_code, unit FROM products`)
+	names := make([]string, len(draft.Lines))
+	for i, l := range draft.Lines {
+		names[i] = l.Name
+	}
+	matches, err := MatchProducts(ctx, h.Pool, names, nil)
 	if err != nil {
 		response.Fail(c, err)
 		return
 	}
-	var products []Candidate
-	for rows.Next() {
-		var cand Candidate
-		if err := rows.Scan(&cand.ID, &cand.Name, &cand.Code, &cand.Unit); err != nil {
-			rows.Close()
-			response.Fail(c, err)
-			return
-		}
-		products = append(products, cand)
-	}
-	rows.Close()
-	matches := make([]LineMatch, len(draft.Lines))
 	computed := decimal.Zero
-	for i, l := range draft.Lines {
-		ranked := rank(l.Name, products, func(x Candidate) string { return x.Name })
-		matches[i].Candidates = top(ranked, 3)
-		if len(ranked) > 0 && ranked[0].score >= 0.999 && (len(ranked) == 1 || ranked[1].score < 0.999) {
-			matches[i].Match = &ranked[0].c
-			matches[i].Candidates = []Candidate{}
-		}
+	for _, l := range draft.Lines {
 		q, qe := decimal.NewFromString(l.Quantity)
 		p, pe := decimal.NewFromString(l.UnitPrice)
 		if qe == nil && pe == nil {
@@ -162,6 +149,56 @@ func (h *Handlers) ContractDraft(c *gin.Context) {
 		"line_matches": matches, "computed_total": computed.String(), "total_matches": totalMatches,
 		"file_name": fh.Filename,
 	})
+}
+
+// MatchProducts pairs item names (and, when given, part numbers) with catalogue products: a
+// part number or an exact name found once is a match; otherwise up to three similar names are
+// offered. Used by AI drafts and by Excel line imports.
+func MatchProducts(ctx context.Context, pool *pgxpool.Pool, names []string, codes []string) ([]LineMatch, error) {
+	rows, err := pool.Query(ctx, `SELECT id, name, manufacturer_code, unit FROM products`)
+	if err != nil {
+		return nil, err
+	}
+	var products []Candidate
+	for rows.Next() {
+		var cand Candidate
+		if err := rows.Scan(&cand.ID, &cand.Name, &cand.Code, &cand.Unit); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		products = append(products, cand)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	matches := make([]LineMatch, len(names))
+	for i, name := range names {
+		matches[i].Candidates = []Candidate{}
+		if i < len(codes) && strings.TrimSpace(codes[i]) != "" {
+			var found []Candidate
+			for _, p := range products {
+				if p.Code != nil && strings.EqualFold(strings.TrimSpace(*p.Code), strings.TrimSpace(codes[i])) {
+					found = append(found, p)
+				}
+			}
+			if len(found) == 1 {
+				matches[i].Match = &found[0]
+				continue
+			}
+			if len(found) > 1 {
+				matches[i].Candidates = found[:min(len(found), 3)]
+				continue
+			}
+		}
+		ranked := rank(name, products, func(x Candidate) string { return x.Name })
+		matches[i].Candidates = top(ranked, 3)
+		if len(ranked) > 0 && ranked[0].score >= 0.999 && (len(ranked) == 1 || ranked[1].score < 0.999) {
+			matches[i].Match = &ranked[0].c
+			matches[i].Candidates = []Candidate{}
+		}
+	}
+	return matches, nil
 }
 
 type scored struct {

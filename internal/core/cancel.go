@@ -32,6 +32,15 @@ func (h *Handlers) DeleteContract(c *gin.Context) {
 		if k.Status != "draft" {
 			return nil, apperrors.Rule("document_not_draft", "Only a draft contract can be deleted.", map[string]any{"status": k.Status})
 		}
+		// Files copied from its quotation stay on the quotation; only the copies go.
+		if _, err := tx.Exec(ctx, `DELETE FROM attachment_links l WHERE l.owner_type='contract' AND l.owner_id=$1
+			AND EXISTS (SELECT 1 FROM attachment_links q JOIN quotations qt ON qt.id=q.owner_id WHERE q.owner_type='quotation' AND q.file_id=l.file_id AND qt.contract_id=$1)`, id); err != nil {
+			return nil, err
+		}
+		// A deleted draft gives its quotation back: it is open (sent) again.
+		if _, err := tx.Exec(ctx, `UPDATE quotations SET status='sent', contract_id=NULL, version=version+1, updated_at=now() WHERE contract_id=$1`, id); err != nil {
+			return nil, err
+		}
 		var draftNumber string
 		if err := tx.QueryRow(ctx, `DELETE FROM contracts WHERE id = $1 RETURNING draft_number`, id).Scan(&draftNumber); err != nil {
 			return nil, err

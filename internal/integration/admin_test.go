@@ -48,7 +48,7 @@ func TestAccountsAndCorrections(t *testing.T) {
 	r := e.do("", "POST", "/api/v1/auth/login", map[string]any{"email": "khoa@test.vn", "password": "temporary-pass-9", "client": "mobile"}, nil)
 	sales = r.data()["token"].(string)
 	// Deactivation ends sessions and blocks sign-in; reactivation restores it.
-	upd := e.must(200, e.do(admin, "PATCH", "/api/v1/users/"+salesID, map[string]any{"full_name": "Khoa Nguyễn", "roles": []string{"sales", "leader"}, "is_active": false}, nil), "deactivate")
+	upd := e.must(200, e.do(admin, "PATCH", "/api/v1/users/"+salesID, map[string]any{"full_name": "Khoa Nguyễn", "roles": []string{"sales", "delivery"}, "is_active": false}, nil), "deactivate")
 	if upd["full_name"] != "Khoa Nguyễn" || upd["is_active"] != false {
 		t.Fatalf("update: %v", upd)
 	}

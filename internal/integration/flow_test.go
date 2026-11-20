@@ -152,10 +152,10 @@ func TestContractToDeliveryFlow(t *testing.T) {
 	e := setup(t)
 	e.user("khoa@test.vn", []string{"sales"})
 	e.user("ha@test.vn", []string{"sales"})
-	e.user("lan@test.vn", []string{"leader"})
+	e.user("lan@test.vn", []string{"delivery"})
 	e.user("mai@test.vn", []string{"accounting"})
 	e.user("nam@test.vn", []string{"admin"})
-	sales, other, leader, acct, admin := e.login("khoa@test.vn"), e.login("ha@test.vn"), e.login("lan@test.vn"), e.login("mai@test.vn"), e.login("nam@test.vn")
+	sales, other, delivery, acct, admin := e.login("khoa@test.vn"), e.login("ha@test.vn"), e.login("lan@test.vn"), e.login("mai@test.vn"), e.login("nam@test.vn")
 
 	customer := e.must(201, e.do(sales, "POST", "/api/v1/organizations", map[string]any{"code": "STRA", "name": "Lọc hóa dầu Sông Trà", "is_customer": true}, nil), "customer")
 	supplier := e.must(201, e.do(sales, "POST", "/api/v1/organizations", map[string]any{"code": "DGA", "name": "Thiết bị Đông Á", "is_supplier": true}, nil), "supplier")
@@ -322,9 +322,12 @@ func TestContractToDeliveryFlow(t *testing.T) {
 	if r := e.do(other, "GET", "/api/v1/reports/contract-lines", nil, nil); r.data()["pagination"].(map[string]any)["total"].(float64) != 0 {
 		t.Fatalf("another salesperson's report must be empty: %v", r.Body)
 	}
-	e.must(200, e.do(leader, "GET", "/api/v1/contracts/"+contractID, nil, nil), "leader reads all")
-	if r := e.do(leader, "POST", "/api/v1/contracts", map[string]any{}, nil); r.Status != 403 {
-		t.Fatalf("leader must not create contracts by default: %d", r.Status)
+	e.must(200, e.do(delivery, "GET", "/api/v1/contracts/"+contractID, nil, nil), "delivery reads all")
+	if r := e.do(delivery, "POST", "/api/v1/contracts", map[string]any{}, nil); r.Status != 403 {
+		t.Fatalf("delivery must not create contracts: %d", r.Status)
+	}
+	if r := e.do(delivery, "POST", "/api/v1/contracts/"+contractID+"/purchase-orders", map[string]any{}, nil); r.Status != 403 {
+		t.Fatalf("delivery must not order from suppliers: %d", r.Status)
 	}
 	if r := e.do(admin, "GET", "/api/v1/contracts", nil, nil); r.Status != 200 || r.data()["pagination"].(map[string]any)["total"].(float64) == 0 {
 		t.Fatalf("admin holds every permission and sees the whole company: %d %v", r.Status, r.Body)
@@ -339,7 +342,7 @@ func TestContractToDeliveryFlow(t *testing.T) {
 	}
 
 	// Report filter: the line shows under "needs action" (no plan) and not under "completed".
-	needs := e.must(200, e.do(leader, "GET", "/api/v1/reports/contract-lines?flag=needs_action", nil, nil), "report")
+	needs := e.must(200, e.do(delivery, "GET", "/api/v1/reports/contract-lines?flag=needs_action", nil, nil), "report")
 	if needs["pagination"].(map[string]any)["total"].(float64) < 1 {
 		t.Fatalf("needs_action report empty: %v", needs)
 	}

@@ -3,13 +3,20 @@ package masterdata
 
 import (
 	"context"
+	"errors"
 	"regexp"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/text/runes"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
 
 	"navo-api/internal/access"
 	"navo-api/internal/apperrors"
@@ -57,6 +64,10 @@ type organizationInput struct {
 	// OwnerID: absent keeps the owner; "" clears it. Only people who see the whole
 	// company may set it; a salesperson creating a customer becomes its owner.
 	OwnerID *string `json:"owner_id"`
+	// Contacts: only on create, added in the same transaction (add customer/supplier form).
+	// Later changes go through the contact endpoints, which apply the owner rule.
+	Contacts []crm.NewContact `json:"contacts"`
+	creating bool
 }
 
 // resolveOwner returns the owner to store (keep=true: leave as is).
@@ -95,7 +106,9 @@ func (in *organizationInput) validate() error {
 	in.Code = strings.ToUpper(strings.TrimSpace(in.Code))
 	in.Name = strings.TrimSpace(in.Name)
 	var errs apperrors.FieldErrors
-	if !orgCode.MatchString(in.Code) {
+	if in.Code == "" && in.creating {
+		// Generated from the name on save (SuggestCode).
+	} else if !orgCode.MatchString(in.Code) {
 		errs.Add("code", "format", map[string]any{"pattern": "2-12 letters A-Z or digits"})
 	}
 	if in.Name == "" {
@@ -112,6 +125,10 @@ func (in *organizationInput) validate() error {
 	if in.TaxCode != nil && *in.TaxCode == "" {
 		in.TaxCode = nil
 	}
+	if len(in.Contacts) > 50 {
+		errs.Add("contacts", "too_many", map[string]any{"max": 50})
+	}
+	crm.CheckContacts(&errs, in.Contacts)
 	return errs.Err()
 }
 
@@ -123,6 +140,7 @@ func (h *Handlers) CreateOrganization(c *gin.Context) {
 		response.Fail(c, err)
 		return
 	}
+	in.creating = true
 	if err := in.validate(); err != nil {
 		response.Fail(c, err)
 		return
@@ -133,6 +151,11 @@ func (h *Handlers) CreateOrganization(c *gin.Context) {
 		if err != nil {
 			return nil, err
 		}
+		if in.Code == "" {
+			if in.Code, err = suggestCode(ctx, tx, in.Name, in.IsCustomer); err != nil {
+				return nil, err
+			}
+		}
 		var id uuid.UUID
 		err = tx.QueryRow(ctx, `INSERT INTO organizations (code, name, is_customer, is_supplier, tax_code, owner_id)
 			VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`, in.Code, in.Name, in.IsCustomer, in.IsSupplier, in.TaxCode, owner).Scan(&id)
@@ -141,6 +164,14 @@ func (h *Handlers) CreateOrganization(c *gin.Context) {
 				return nil, apperrors.Invalid("code", "taken", nil)
 			}
 			return nil, err
+		}
+		if len(in.Contacts) > 0 {
+			if !p.Can(access.ContactsWrite) {
+				return nil, apperrors.Forbidden("missing_permission")
+			}
+			if err := crm.InsertContacts(ctx, tx, id, in.Contacts); err != nil {
+				return nil, err
+			}
 		}
 		o, err := loadOrganization(ctx, tx, p, id)
 		if err != nil {
@@ -208,6 +239,7 @@ func (h *Handlers) ListOrganizations(c *gin.Context) {
 // Product is a catalogue item; documents keep their own snapshot of names (BR-01).
 type Product struct {
 	ID               uuid.UUID `json:"id"`
+	Code             string    `json:"code"`
 	Name             string    `json:"name"`
 	Manufacturer     *string   `json:"manufacturer"`
 	ManufacturerCode *string   `json:"manufacturer_code"`
@@ -222,6 +254,8 @@ type Product struct {
 }
 
 type productInput struct {
+	// Code: typed by the user, or empty to number it (SP-00001…). Empty on edit keeps it.
+	Code             *string `json:"code"`
 	Name             string  `json:"name"`
 	Manufacturer     *string `json:"manufacturer"`
 	ManufacturerCode *string `json:"manufacturer_code"`
@@ -233,11 +267,11 @@ type productInput struct {
 	supplier         *uuid.UUID
 }
 
-const productSelect = `SELECT p.id, p.name, p.manufacturer, p.manufacturer_code, p.unit, p.description, p.origin, p.supplier_id, s.name, p.supplier_item_code
+const productSelect = `SELECT p.id, p.code, p.name, p.manufacturer, p.manufacturer_code, p.unit, p.description, p.origin, p.supplier_id, s.name, p.supplier_item_code
 	FROM products p LEFT JOIN organizations s ON s.id = p.supplier_id`
 
 func (p *Product) dest() []any {
-	return []any{&p.ID, &p.Name, &p.Manufacturer, &p.ManufacturerCode, &p.Unit, &p.Description, &p.Origin, &p.SupplierID, &p.SupplierName, &p.SupplierItemCode}
+	return []any{&p.ID, &p.Code, &p.Name, &p.Manufacturer, &p.ManufacturerCode, &p.Unit, &p.Description, &p.Origin, &p.SupplierID, &p.SupplierName, &p.SupplierItemCode}
 }
 
 // save inserts (id nil) or updates a product and returns it as stored.
@@ -251,16 +285,20 @@ func (in *productInput) save(ctx context.Context, tx pgx.Tx, id *uuid.UUID) (*Pr
 	var out uuid.UUID
 	var err error
 	if id == nil {
-		err = tx.QueryRow(ctx, `INSERT INTO products (name, manufacturer, manufacturer_code, unit, description, origin, supplier_id, supplier_item_code)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`, in.Name, in.Manufacturer, in.ManufacturerCode, in.Unit, in.Description, in.Origin, in.supplier, in.SupplierItemCode).Scan(&out)
+		err = tx.QueryRow(ctx, `INSERT INTO products (name, manufacturer, manufacturer_code, unit, description, origin, supplier_id, supplier_item_code, code)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, next_product_code())) RETURNING id`, in.Name, in.Manufacturer, in.ManufacturerCode, in.Unit, in.Description, in.Origin, in.supplier, in.SupplierItemCode, in.Code).Scan(&out)
 	} else {
 		out = *id
 		_, err = tx.Exec(ctx, `UPDATE products SET name = $2, manufacturer = $3, manufacturer_code = $4, unit = $5, description = $6, origin = $7,
-			supplier_id = $8, supplier_item_code = $9, version = version + 1, updated_at = now() WHERE id = $1`,
-			out, in.Name, in.Manufacturer, in.ManufacturerCode, in.Unit, in.Description, in.Origin, in.supplier, in.SupplierItemCode)
+			supplier_id = $8, supplier_item_code = $9, code = COALESCE($10, code), version = version + 1, updated_at = now() WHERE id = $1`,
+			out, in.Name, in.Manufacturer, in.ManufacturerCode, in.Unit, in.Description, in.Origin, in.supplier, in.SupplierItemCode, in.Code)
 	}
 	if err != nil {
 		if appErr := apperrors.From(err); appErr.Reason == "duplicate" {
+			var pg *pgconn.PgError
+			if errors.As(err, &pg) && pg.ConstraintName == "products_code_key" {
+				return nil, apperrors.Invalid("code", "taken", nil)
+			}
 			return nil, apperrors.Invalid("manufacturer_code", "taken", nil)
 		}
 		return nil, err
@@ -275,6 +313,13 @@ func (in *productInput) save(ctx context.Context, tx pgx.Tx, id *uuid.UUID) (*Pr
 func (in *productInput) validate() error {
 	in.Name, in.Unit = strings.TrimSpace(in.Name), strings.TrimSpace(in.Unit)
 	var errs apperrors.FieldErrors
+	if in.Code = blankToNil(in.Code); in.Code != nil {
+		up := strings.ToUpper(*in.Code)
+		in.Code = &up
+		if !productCode.MatchString(up) {
+			errs.Add("code", "format", map[string]any{"pattern": "2-30 letters A-Z, digits, . _ -"})
+		}
+	}
 	if in.Name == "" {
 		errs.Add("name", "required", nil)
 	} else if len([]rune(in.Name)) > 300 {
@@ -330,9 +375,9 @@ func (h *Handlers) CreateProduct(c *gin.Context) {
 func (h *Handlers) ListProducts(c *gin.Context) {
 	page, size := httpx.Page(c)
 	q := strings.TrimSpace(c.Query("q"))
-	rows, err := h.Pool.Query(c.Request.Context(), `SELECT p.id, p.name, p.manufacturer, p.manufacturer_code, p.unit, p.description, p.origin, p.supplier_id, s.name, p.supplier_item_code, count(*) OVER ()
+	rows, err := h.Pool.Query(c.Request.Context(), `SELECT p.id, p.code, p.name, p.manufacturer, p.manufacturer_code, p.unit, p.description, p.origin, p.supplier_id, s.name, p.supplier_item_code, count(*) OVER ()
 		FROM products p LEFT JOIN organizations s ON s.id = p.supplier_id
-		WHERE $1 = '' OR p.name ILIKE '%' || $1 || '%' OR p.manufacturer_code ILIKE '%' || $1 || '%' OR p.manufacturer ILIKE '%' || $1 || '%' OR p.supplier_item_code ILIKE '%' || $1 || '%'
+		WHERE $1 = '' OR p.code ILIKE '%' || $1 || '%' OR p.name ILIKE '%' || $1 || '%' OR p.manufacturer_code ILIKE '%' || $1 || '%' OR p.manufacturer ILIKE '%' || $1 || '%' OR p.supplier_item_code ILIKE '%' || $1 || '%'
 		ORDER BY p.name, p.id LIMIT $2 OFFSET $3`, q, size, (page-1)*size)
 	if err != nil {
 		response.Fail(c, err)
@@ -379,6 +424,10 @@ func (h *Handlers) UpdateOrganization(c *gin.Context) {
 	var in organizationInput
 	if err := httpx.Decode(c, &in); err != nil {
 		response.Fail(c, err)
+		return
+	}
+	if len(in.Contacts) > 0 {
+		response.Fail(c, apperrors.Invalid("contacts", "edit_contacts_separately", nil))
 		return
 	}
 	if err := in.validate(); err != nil {
@@ -460,4 +509,79 @@ func (h *Handlers) UpdateProduct(c *gin.Context) {
 		}
 		return p, audit.Record(ctx, tx, "update", "product", id, map[string]any{"before": before, "after": p})
 	})
+}
+
+var productCode = regexp.MustCompile(`^[A-Z0-9][A-Z0-9._-]{1,29}$`)
+
+var accents = transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
+
+// suggestCode makes a free partner code from the name: initials of the words (Lọc hóa dầu
+// Sông Trà → LHDST), or the start of a one-word name; KH/NCC when the name gives too little;
+// a number is added when the code is taken (LHDST2).
+func suggestCode(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, name string, customer bool) (string, error) {
+	folded, _, _ := transform.String(accents, strings.ToUpper(name))
+	folded = strings.NewReplacer("Đ", "D", "đ", "D").Replace(folded)
+	words := strings.FieldsFunc(folded, func(r rune) bool { return !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') })
+	// Company-form words carry no meaning in a code.
+	skip := map[string]bool{"CONG": true, "TY": true, "CTY": true, "TNHH": true, "CP": true, "CO": true, "PHAN": true, "MTV": true, "JSC": true, "LTD": true, "CORP": true, "COMPANY": true}
+	base := ""
+	kept := []string{}
+	for _, w := range words {
+		if !skip[w] {
+			kept = append(kept, w)
+		}
+	}
+	if len(kept) == 1 {
+		base = kept[0]
+	} else {
+		for _, w := range kept {
+			base += w[:1]
+		}
+	}
+	if len(base) > 8 {
+		base = base[:8]
+	}
+	if len(base) < 2 {
+		base = "NCC"
+		if customer {
+			base = "KH"
+		}
+	}
+	for n := 1; n < 10000; n++ {
+		code := base
+		if n > 1 || base == "KH" || base == "NCC" {
+			suffix := strconv.Itoa(n)
+			code = base[:min(len(base), 12-len(suffix))] + suffix
+		}
+		var taken bool
+		if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM organizations WHERE code = $1)`, code).Scan(&taken); err != nil {
+			return "", err
+		}
+		if !taken {
+			return code, nil
+		}
+	}
+	return "", apperrors.Rule("code_unavailable", "No free code; type one.", nil)
+}
+
+// SuggestCode handles GET /organizations/suggest-code?name=&role=customer|supplier.
+func (h *Handlers) SuggestCode(c *gin.Context) {
+	code, err := suggestCode(c.Request.Context(), h.Pool, c.Query("name"), c.Query("role") != "supplier")
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, gin.H{"code": code})
+}
+
+// SuggestProductCode handles GET /products/suggest-code: the next free SP-number (it is used up).
+func (h *Handlers) SuggestProductCode(c *gin.Context) {
+	var code string
+	if err := h.Pool.QueryRow(c.Request.Context(), `SELECT next_product_code()`).Scan(&code); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, gin.H{"code": code})
 }

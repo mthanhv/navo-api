@@ -90,12 +90,24 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	a.POST("/handovers", need(access.UsersManage), us.Handover)
 
 	a.GET("/organizations", need(access.ContractsRead), md.ListOrganizations)
+	a.GET("/organizations/suggest-code", need(access.PartnersWrite), md.SuggestCode)
 	a.POST("/organizations", need(access.PartnersWrite), md.CreateOrganization)
 	a.PATCH("/organizations/:id", need(access.PartnersWrite), md.UpdateOrganization)
 	a.GET("/products", need(access.ContractsRead), md.ListProducts)
+	a.GET("/products/suggest-code", need(access.CatalogWrite), md.SuggestProductCode)
 	a.POST("/products", need(access.CatalogWrite), md.CreateProduct)
 	a.PATCH("/products/:id", need(access.CatalogWrite), md.UpdateProduct)
 
+	// Quotations: sales work, so the contract-writing permission gates them (2026-11-20).
+	a.GET("/quotations", need(access.ContractsWrite), co.ListQuotations)
+	a.POST("/quotations", need(access.ContractsWrite), co.CreateQuotation)
+	a.GET("/quotations/:id", need(access.ContractsWrite), co.GetQuotation)
+	a.PATCH("/quotations/:id", need(access.ContractsWrite), co.UpdateQuotation)
+	a.DELETE("/quotations/:id", need(access.ContractsWrite), co.DeleteQuotation)
+	a.POST("/quotations/:id/send", need(access.ContractsWrite), co.QuotationStatus("send"))
+	a.POST("/quotations/:id/lost", need(access.ContractsWrite), co.QuotationStatus("lost"))
+	a.POST("/quotations/:id/reopen", need(access.ContractsWrite), co.QuotationStatus("reopen"))
+	a.GET("/quotations/:id/contract-input", need(access.ContractsWrite), co.QuotationContractInput)
 	a.GET("/contracts", need(access.ContractsRead), co.ListContracts)
 	a.GET("/contracts/owners", need(access.ContractsRead), co.ListOwners)
 	a.GET("/search", need(access.ContractsRead), co.Search)
@@ -147,6 +159,7 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	a.GET("/documents/customers/:id", need(access.ContractsRead), docs.CustomerFiles)
 	a.GET("/documents/contracts/:id", need(access.ContractsRead), docs.Contract)
 	a.GET("/documents/contracts/:id/zip", need(access.ContractsRead), docs.Zip)
+	a.GET("/files", need(access.ContractsRead), docs.OwnerFiles)
 	a.POST("/files", need(access.ContractsRead), docs.Upload)
 	a.GET("/files/:id", need(access.ContractsRead), docs.Download)
 	a.DELETE("/attachment-links/:id", need(access.ContractsRead), docs.Unlink)
@@ -215,6 +228,8 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	// Starting master data (customers, suppliers, products): preview, then commit.
 	imp := &imports.Handlers{Pool: pool}
 	a.GET("/imports/:kind/template", need(access.ContractsRead), imp.Template)
+	// Item lines from Excel for the contract and quotation forms (read only, 2026-11-20).
+	a.POST("/line-imports", need(access.ContractsWrite), imp.ReadLines)
 	a.POST("/imports/:kind/preview", need(access.ContractsRead), imp.Preview)
 	a.POST("/imports/:kind/commit", need(access.ContractsRead), imp.Commit)
 

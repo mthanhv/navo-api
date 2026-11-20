@@ -108,7 +108,7 @@ func main() {
 
 	accounts := []users.Input{
 		{Email: "admin@congty.vn", FullName: "Vũ Hoàng Nam", Roles: []string{"admin"}},
-		{Email: "lan@congty.vn", FullName: "Đỗ Thị Lan", Roles: []string{"leader"}},
+		{Email: "tuan@congty.vn", FullName: "Lê Văn Tuấn", Roles: []string{"delivery"}},
 		{Email: "mai@congty.vn", FullName: "Phan Ngọc Mai", Roles: []string{"accounting"}},
 		{Email: "khoa@congty.vn", FullName: "Trần Minh Khoa", Roles: []string{"sales"}},
 		{Email: "ha@congty.vn", FullName: "Nguyễn Thu Hà", Roles: []string{"sales"}},

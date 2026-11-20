@@ -200,8 +200,8 @@ func raceAfterLock(t *testing.T, e *env, query, id, waitPattern string, actions 
 func TestOperationalCorrections(t *testing.T) {
 	e := setup(t)
 	e.user("ops@test.vn", []string{"sales"})
-	e.user("read@test.vn", []string{"leader"})
-	sales, leader := e.login("ops@test.vn"), e.login("read@test.vn")
+	e.user("read@test.vn", []string{"delivery"})
+	sales, reader := e.login("ops@test.vn"), e.login("read@test.vn")
 	day := time.Now().In(time.FixedZone("VN", 7*3600)).Format(time.DateOnly)
 	cust := e.must(201, e.do(sales, "POST", "/api/v1/organizations", map[string]any{"code": "OPC", "name": "Customer", "is_customer": true}, nil), "customer")
 	sup := e.must(201, e.do(sales, "POST", "/api/v1/organizations", map[string]any{"code": "OPS", "name": "Supplier", "is_supplier": true}, nil), "supplier")
@@ -218,7 +218,7 @@ func TestOperationalCorrections(t *testing.T) {
 	if file["file_id"] != retry["file_id"] {
 		t.Fatal("upload duplicated")
 	}
-	if r := e.upload(leader, "contract", cid, "minutes", "bad.pdf", pdf); r.Status != 403 {
+	if r := e.upload(reader, "contract", cid, "minutes", "bad.pdf", pdf); r.Status != 403 {
 		t.Fatalf("reader attached: %v", r.Body)
 	}
 	k = e.must(200, e.do(sales, "POST", "/api/v1/contracts/"+cid+"/activate", map[string]any{"signed_on": day}, key("op-act")), "activate")

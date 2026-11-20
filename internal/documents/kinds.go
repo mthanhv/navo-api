@@ -20,6 +20,7 @@ const (
 	OwnerReceipt         = "receipt"
 	OwnerPayment         = "payment"
 	OwnerNote            = "note"
+	OwnerQuotation       = "quotation"
 )
 
 // kind describes one document kind: where it may be attached, who may see it, and
@@ -33,10 +34,11 @@ type kind struct {
 var kinds = map[string]kind{
 	"signed_contract":       {owners: []string{OwnerContract}, ascii: "HopDong"},
 	"amendment":             {owners: []string{OwnerContract}, ascii: "PhuLuc"},
-	"quotation":             {owners: []string{OwnerContract}, ascii: "BaoGia"},
+	"quotation":             {owners: []string{OwnerContract, OwnerQuotation}, ascii: "BaoGia"},
+	"customer_request":      {owners: []string{OwnerQuotation, OwnerContract}, ascii: "YeuCauBaoGia"},
 	"customer_order":        {owners: []string{OwnerContract}, ascii: "DonHangKhach"},
 	"minutes":               {owners: []string{OwnerContract, OwnerCustomer}, ascii: "BienBan"},
-	"correspondence":        {owners: []string{OwnerContract, OwnerCustomer}, ascii: "ThuTu"},
+	"correspondence":        {owners: []string{OwnerContract, OwnerCustomer, OwnerQuotation}, ascii: "ThuTu"},
 	"profile":               {owners: []string{OwnerCustomer}, ascii: "HoSoNangLuc"},
 	"nda":                   {owners: []string{OwnerCustomer}, ascii: "NDA"},
 	"po_signed":             {owners: []string{OwnerPurchaseOrder}, need: access.PurchaseCostRead, ascii: "DonMua"},
@@ -48,10 +50,10 @@ var kinds = map[string]kind{
 	"cq":                    {owners: []string{OwnerPurchaseOrder, OwnerGoodsReceipt, OwnerDeliveryOrder}, ascii: "CQ"},
 	"delivery_note":         {owners: []string{OwnerDeliveryOrder}, ascii: "BienBanGiaoNhan"},
 	"acceptance":            {owners: []string{OwnerDeliveryOrder}, ascii: "BienBanNghiemThu"},
-	"photo":                 {owners: []string{OwnerContract, OwnerGoodsReceipt, OwnerDeliveryOrder, OwnerNote}, ascii: "Anh"},
+	"photo":                 {owners: []string{OwnerContract, OwnerGoodsReceipt, OwnerDeliveryOrder, OwnerNote, OwnerQuotation}, ascii: "Anh"},
 	"sales_invoice":         {owners: []string{OwnerSalesInvoice}, need: access.FinanceRead, ascii: "HoaDonBan"},
 	"bank":                  {owners: []string{OwnerReceipt, OwnerPayment}, need: access.FinanceRead, ascii: "ChungTuNganHang"},
-	"other":                 {owners: []string{OwnerCustomer, OwnerContract, OwnerPurchaseOrder, OwnerGoodsReceipt, OwnerDeliveryOrder, OwnerSalesInvoice, OwnerPurchaseInvoice, OwnerReceipt, OwnerPayment}, ascii: "Khac"},
+	"other":                 {owners: []string{OwnerCustomer, OwnerContract, OwnerPurchaseOrder, OwnerGoodsReceipt, OwnerDeliveryOrder, OwnerSalesInvoice, OwnerPurchaseInvoice, OwnerReceipt, OwnerPayment, OwnerQuotation}, ascii: "Khac"},
 }
 
 // financeOwner reports owner types that only finance may see, whatever the kind.
@@ -90,7 +92,7 @@ func allowed(ownerType, docKind string) bool {
 
 // KindsFor lists the kinds that may be attached to an owner type (for the upload form).
 func KindsFor(ownerType string) []string {
-	order := []string{"signed_contract", "amendment", "quotation", "customer_order", "po_signed", "supplier_confirmation", "supplier_invoice", "receipt_note",
+	order := []string{"signed_contract", "amendment", "quotation", "customer_request", "customer_order", "po_signed", "supplier_confirmation", "supplier_invoice", "receipt_note",
 		"packing_list", "co", "cq", "delivery_note", "acceptance", "sales_invoice", "bank", "photo", "minutes", "correspondence", "profile", "nda", "other"}
 	out := []string{}
 	for _, k := range order {

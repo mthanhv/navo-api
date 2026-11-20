@@ -16,8 +16,8 @@ make run                        # http://localhost:8080
 make check && make test-integration
 ```
 
-Demo accounts (password = `NAVO_SEED_PASSWORD`): `admin@congty.vn` (admin), `lan@congty.vn`
-(leader), `mai@congty.vn` (accounting), `khoa@congty.vn` and `ha@congty.vn` (sales). The demo
+Demo accounts (password = `NAVO_SEED_PASSWORD`): `admin@congty.vn` (admin), `tuan@congty.vn`
+(delivery), `mai@congty.vn` (accounting), `khoa@congty.vn` and `ha@congty.vn` (sales). The demo
 data reproduces the mockups: contract SC-26-0001 (Sông Trà) with the AC-01 line at 50/100 and no
 plan, a late PO, an under-ordered line; SC-26-0002 (Đạm Phương Nam) overdue; one draft contract.
 For a single real account use `NAVO_USER_PASSWORD=… make user EMAIL=… NAME=… ROLES=…`.
