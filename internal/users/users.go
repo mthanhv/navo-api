@@ -67,7 +67,7 @@ func (in *Input) Validate() error {
 	}
 	for _, r := range in.Roles {
 		if !access.ValidRole(r) {
-			errs.Add("roles", "one_of", map[string]any{"values": []string{"sales", "delivery", "accounting", "admin"}})
+			errs.Add("roles", "one_of", map[string]any{"values": []string{"sales", "sales_manager", "delivery", "accounting", "admin"}})
 			break
 		}
 	}

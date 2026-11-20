@@ -81,8 +81,11 @@ const milestoneSQL = `
 SELECT m.id, m.contract_id, c.number, c.customer_id, cu.name, m.seq, m.version, m.name, m.percent::text, m.amount::text, c.currency, m.trigger,
        m.days_after, m.fixed_due_on, m.triggered_on, m.trigger_note, m.acceptance_id, c.signed_on,
        NOT EXISTS (SELECT 1 FROM contract_lines cl WHERE cl.contract_id = c.id AND cl.quantity > line_delivered(cl.id)) AS fully_delivered,
-       (SELECT d.number || ' ' || d.delivered_on::text FROM delivery_orders d WHERE d.contract_id = c.id AND d.status = 'confirmed'
-        ORDER BY d.delivered_on DESC, d.number DESC LIMIT 1) AS last_delivery,
+       (SELECT x.number || ' ' || x.on_date::text FROM (
+            SELECT d.number, d.delivered_on AS on_date FROM delivery_orders d WHERE d.contract_id = c.id AND d.status = 'confirmed'
+            UNION ALL SELECT v.number, v.done_on FROM service_visits v -- service visits finish service lines (5.13)
+            WHERE v.contract_id = c.id AND v.status = 'done' AND EXISTS (SELECT 1 FROM service_visit_lines vl WHERE vl.visit_id = v.id)
+        ) x ORDER BY x.on_date DESC, x.number DESC LIMIT 1) AS last_delivery,
        coalesce((SELECT sum(a.amount) FROM receipt_allocations a WHERE a.milestone_id = m.id AND a.reversed_at IS NULL), 0)::text
 FROM payment_milestones m JOIN contracts c ON c.id = m.contract_id JOIN organizations cu ON cu.id = c.customer_id`
 

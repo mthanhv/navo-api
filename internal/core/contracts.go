@@ -12,6 +12,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"navo-api/internal/access"
+	"navo-api/internal/activitylog"
 	"navo-api/internal/apperrors"
 	"navo-api/internal/audit"
 	"navo-api/internal/auth"
@@ -41,6 +42,10 @@ type Contract struct {
 	OwnerName         string    `json:"owner_name"`
 	Version           int64     `json:"version"`
 	DeliveryLocation  *string   `json:"delivery_location"`
+	// Kind: supply (goods) or service (maintenance & repair, REQUIREMENTS 5.13) with its period.
+	Kind        string  `json:"kind"`
+	ServiceFrom *string `json:"service_from"`
+	ServiceTo   *string `json:"service_to"`
 	// Value is the sum of quantity × unit price (sales prices, visible with the contract).
 	Value      string    `json:"value"`
 	FinalDueOn *string   `json:"final_due_on"`
@@ -63,17 +68,18 @@ type ContractAttention struct {
 }
 
 const contractSelect = `SELECT c.id, c.number, c.draft_number, c.status, c.customer_id, o.code, o.name, c.title,
-	c.customer_reference, c.currency, c.signed_on, c.owner_id, u.full_name, c.version, c.delivery_location,
+	c.customer_reference, c.currency, c.signed_on, c.owner_id, u.full_name, c.version, c.delivery_location, c.kind, c.service_from, c.service_to,
 	(SELECT coalesce(round(sum(cl.quantity * cl.unit_price), 2), 0)::text FROM contract_lines cl WHERE cl.contract_id = c.id),
 	(SELECT max(cl.due_on) FROM contract_lines cl WHERE cl.contract_id = c.id)
 	FROM contracts c JOIN organizations o ON o.id = c.customer_id JOIN users u ON u.id = c.owner_id`
 
 func scanContract(row pgx.Row) (Contract, error) {
 	var k Contract
-	var signed, finalDue *time.Time
+	var signed, finalDue, from, to *time.Time
 	err := row.Scan(&k.ID, &k.Number, &k.DraftNumber, &k.Status, &k.CustomerID, &k.CustomerCode, &k.CustomerName, &k.Title,
-		&k.CustomerReference, &k.Currency, &signed, &k.OwnerID, &k.OwnerName, &k.Version, &k.DeliveryLocation, &k.Value, &finalDue)
+		&k.CustomerReference, &k.Currency, &signed, &k.OwnerID, &k.OwnerName, &k.Version, &k.DeliveryLocation, &k.Kind, &from, &to, &k.Value, &finalDue)
 	k.SignedOn, k.FinalDueOn = dateString(signed), dateString(finalDue)
+	k.ServiceFrom, k.ServiceTo = dateString(from), dateString(to)
 	if err == nil {
 		k.Value = decimalx.MustParse(k.Value).String()
 	}
@@ -117,6 +123,8 @@ type contractLineInput struct {
 	UnitPrice      string  `json:"unit_price"`
 	TaxRate        *string `json:"tax_rate"`
 	DueOn          *string `json:"due_on"`
+	// LineType: goods (default) or service (fulfilled by service visits).
+	LineType *string `json:"line_type,omitempty"`
 }
 
 type contractInput struct {
@@ -131,6 +139,10 @@ type contractInput struct {
 	Milestones        []finance.DraftTerm `json:"milestones"`
 	// QuotationID: the contract is created from this quotation, which becomes won.
 	QuotationID *string `json:"quotation_id,omitempty"`
+	// Kind supply|service (default supply); the service period applies to service contracts.
+	Kind        *string `json:"kind,omitempty"`
+	ServiceFrom *string `json:"service_from,omitempty"`
+	ServiceTo   *string `json:"service_to,omitempty"`
 }
 
 type parsedLine struct {
@@ -141,6 +153,7 @@ type parsedLine struct {
 	unitPrice decimal.Decimal
 	taxRate   *decimal.Decimal
 	dueOn     *time.Time
+	lineType  string
 }
 
 // CreateContract handles POST /contracts (a draft; numbered when activated).
@@ -197,6 +210,20 @@ func (h *Handlers) saveContract(c *gin.Context, editing bool) {
 	if len(in.Lines) == 0 {
 		errs.Add("lines", "required", map[string]any{"min": 1})
 	}
+	kind := "supply"
+	if in.Kind != nil && *in.Kind != "" {
+		kind = *in.Kind
+	}
+	if kind != "supply" && kind != "service" {
+		errs.Add("kind", "one_of", map[string]any{"values": []string{"supply", "service"}})
+	}
+	var serviceFrom, serviceTo *time.Time
+	if kind == "service" {
+		serviceFrom, serviceTo = httpx.Date(&errs, "service_from", in.ServiceFrom), httpx.Date(&errs, "service_to", in.ServiceTo)
+		if serviceFrom != nil && serviceTo != nil && serviceTo.Before(*serviceFrom) {
+			errs.Add("service_to", "after_start", nil)
+		}
+	}
 	var quotationID *uuid.UUID
 	if !editing && in.QuotationID != nil && *in.QuotationID != "" {
 		qid := httpx.UUID(&errs, "quotation_id", *in.QuotationID)
@@ -212,6 +239,16 @@ func (h *Handlers) saveContract(c *gin.Context, editing bool) {
 			dueOn:     httpx.Date(&errs, f("due_on"), l.DueOn),
 			name:      trimmed(l.NameOnContract),
 			unit:      trimmed(l.Unit),
+			lineType:  "goods",
+		}
+		if l.LineType != nil && *l.LineType != "" {
+			lines[i].lineType = *l.LineType
+		}
+		switch {
+		case lines[i].lineType != "goods" && lines[i].lineType != "service":
+			errs.Add(f("line_type"), "one_of", map[string]any{"values": []string{"goods", "service"}})
+		case lines[i].lineType == "service" && kind != "service":
+			errs.Add(f("line_type"), "service_needs_service_contract", nil)
 		}
 		if l.TaxRate != nil && *l.TaxRate != "" {
 			rate := decimalx.NonNegative(&errs, f("tax_rate"), *l.TaxRate)
@@ -263,7 +300,7 @@ func (h *Handlers) saveContract(c *gin.Context, editing bool) {
 			}
 			var dependent bool
 			if oldCustomer != customerID {
-				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM notes WHERE contract_id=$1) OR EXISTS(SELECT 1 FROM attachment_links WHERE contract_id=$1)`, editingID).Scan(&dependent); err != nil {
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM activities WHERE contract_id=$1) OR EXISTS(SELECT 1 FROM attachment_links WHERE contract_id=$1)`, editingID).Scan(&dependent); err != nil {
 					return nil, err
 				}
 				if dependent {
@@ -282,9 +319,13 @@ func (h *Handlers) saveContract(c *gin.Context, editing bool) {
 				return nil, apperrors.Invalid("milestones", "edit_terms_separately", nil)
 			}
 		}
+		// A lead can get a contract; it becomes a customer here and "won" when the contract is signed.
 		var isCustomer bool
-		if err := tx.QueryRow(ctx, `SELECT is_customer FROM organizations WHERE id = $1`, customerID).Scan(&isCustomer); err != nil || !isCustomer {
+		if err := tx.QueryRow(ctx, `SELECT `+activitylog.CustomerOrLead+` FROM organizations o WHERE o.id = $1`, customerID).Scan(&isCustomer); err != nil || !isCustomer {
 			return nil, apperrors.Invalid("customer_id", "not_customer", nil)
+		}
+		if err := activitylog.BecomeCustomer(ctx, tx, customerID); err != nil {
+			return nil, err
 		}
 		products, err := loadProducts(ctx, tx, lines)
 		if err != nil {
@@ -301,7 +342,7 @@ func (h *Handlers) saveContract(c *gin.Context, editing bool) {
 		}
 		id := editingID
 		if editing {
-			if _, err := tx.Exec(ctx, `UPDATE contracts SET customer_id=$2,title=$3,customer_reference=$4,currency=$5,owner_id=$6,delivery_location=$7,version=version+1,updated_at=now() WHERE id=$1`, id, customerID, in.Title, in.CustomerReference, in.Currency, owner, in.DeliveryLocation); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE contracts SET customer_id=$2,title=$3,customer_reference=$4,currency=$5,owner_id=$6,delivery_location=$7,kind=$8,service_from=$9,service_to=$10,version=version+1,updated_at=now() WHERE id=$1`, id, customerID, in.Title, in.CustomerReference, in.Currency, owner, in.DeliveryLocation, kind, serviceFrom, serviceTo); err != nil {
 				return nil, err
 			}
 			if _, err := tx.Exec(ctx, `DELETE FROM contract_lines WHERE contract_id=$1`, id); err != nil {
@@ -312,9 +353,9 @@ func (h *Handlers) saveContract(c *gin.Context, editing bool) {
 			if err != nil {
 				return nil, err
 			}
-			if err := tx.QueryRow(ctx, `INSERT INTO contracts (draft_number, customer_id, title, customer_reference, currency, owner_id, created_by, delivery_location)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-				numbering.DraftNumber(seq), customerID, in.Title, in.CustomerReference, in.Currency, owner, p.UserID, in.DeliveryLocation).Scan(&id); err != nil {
+			if err := tx.QueryRow(ctx, `INSERT INTO contracts (draft_number, customer_id, title, customer_reference, currency, owner_id, created_by, delivery_location, kind, service_from, service_to)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
+				numbering.DraftNumber(seq), customerID, in.Title, in.CustomerReference, in.Currency, owner, p.UserID, in.DeliveryLocation, kind, serviceFrom, serviceTo).Scan(&id); err != nil {
 				return nil, err
 			}
 			// The first contract for an unassigned customer makes its owner the customer's owner.
@@ -332,8 +373,8 @@ func (h *Handlers) saveContract(c *gin.Context, editing bool) {
 			if l.unit != nil {
 				unit = *l.unit
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO contract_lines (contract_id, line_no, product_id, name_on_contract, unit, quantity, unit_price, tax_rate, due_on)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, id, i+1, l.productID, name, unit, l.quantity, l.unitPrice, l.taxRate, l.dueOn); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO contract_lines (contract_id, line_no, product_id, name_on_contract, unit, quantity, unit_price, tax_rate, due_on, line_type)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`, id, i+1, l.productID, name, unit, l.quantity, l.unitPrice, l.taxRate, l.dueOn, l.lineType); err != nil {
 				return nil, err
 			}
 		}
@@ -408,6 +449,10 @@ func (h *Handlers) ListContracts(c *gin.Context) {
 	var errs apperrors.FieldErrors
 	customer := optionalUUID(&errs, "customer_id", c.Query("customer_id"))
 	ownerParam := optionalUUID(&errs, "owner_id", c.Query("owner_id"))
+	kind := c.Query("kind")
+	if kind != "" && kind != "supply" && kind != "service" {
+		errs.Add("kind", "one_of", map[string]any{"values": []string{"supply", "service"}})
+	}
 	tab := c.Query("tab")
 	if tab != "" && tab != "action" && tab != "soon" && tab != "all" && tab != "draft" && tab != "ended" {
 		errs.Add("tab", "one_of", map[string]any{"values": []string{"action", "soon", "all", "draft", "ended"}})
@@ -428,10 +473,10 @@ func (h *Handlers) ListContracts(c *gin.Context) {
 		statuses = []string{s}
 	}
 	rows, err := h.Pool.Query(ctx, contractSelect+`
-		WHERE ($1::uuid IS NULL OR c.owner_id = $1) AND c.status = ANY($2) AND ($4::uuid IS NULL OR c.customer_id = $4)
+		WHERE ($1::uuid IS NULL OR c.owner_id = $1) AND c.status = ANY($2) AND ($4::uuid IS NULL OR c.customer_id = $4) AND ($5 = '' OR c.kind = $5)
 		  AND ($3 = '' OR c.number ILIKE '%' || $3 || '%' OR c.draft_number ILIKE '%' || $3 || '%' OR c.title ILIKE '%' || $3 || '%'
 		       OR o.name ILIKE '%' || $3 || '%' OR o.code ILIKE '%' || $3 || '%' OR c.customer_reference ILIKE '%' || $3 || '%')
-		ORDER BY (c.status = 'active') DESC, c.number DESC NULLS LAST, c.created_at DESC, c.id`, owner, statuses, q, customer)
+		ORDER BY (c.status = 'active') DESC, c.number DESC NULLS LAST, c.created_at DESC, c.id`, owner, statuses, q, customer, kind)
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -621,6 +666,16 @@ func (h *Handlers) ActivateContract(c *gin.Context) {
 			WHERE id = $1`, id, number, *signed); err != nil {
 			return nil, err
 		}
+		var customer uuid.UUID
+		if err := tx.QueryRow(ctx, `SELECT customer_id FROM contracts WHERE id = $1`, id).Scan(&customer); err != nil {
+			return nil, err
+		}
+		if err := activitylog.Won(ctx, tx, customer); err != nil {
+			return nil, err
+		}
+		if err := activitylog.Auto(ctx, tx, "note", customer, &id, nil, k.OwnerID, p.UserID, "Hợp đồng "+number+" đã ký"); err != nil {
+			return nil, err
+		}
 		if err := audit.Record(ctx, tx, "activate", "contract", id, map[string]any{"status": []string{"draft", "active"},
 			"number": number, "signed_on": signed.Format(time.DateOnly)}); err != nil {
 			return nil, err
@@ -652,7 +707,7 @@ func (h *Handlers) DraftContractInput(c *gin.Context) {
 	var in contractInput
 	var owner uuid.UUID
 	var version int64
-	err = h.Pool.QueryRow(ctx, `SELECT customer_id,title,customer_reference,delivery_location,currency,owner_id,version FROM contracts WHERE id=$1 AND status='draft' AND ($2::uuid IS NULL OR owner_id=$2)`, id, p.OwnerFilter()).Scan(&in.CustomerID, &in.Title, &in.CustomerReference, &in.DeliveryLocation, &in.Currency, &owner, &version)
+	err = h.Pool.QueryRow(ctx, `SELECT customer_id,title,customer_reference,delivery_location,currency,owner_id,version,kind,to_char(service_from,'YYYY-MM-DD'),to_char(service_to,'YYYY-MM-DD') FROM contracts WHERE id=$1 AND status='draft' AND ($2::uuid IS NULL OR owner_id=$2)`, id, p.OwnerFilter()).Scan(&in.CustomerID, &in.Title, &in.CustomerReference, &in.DeliveryLocation, &in.Currency, &owner, &version, &in.Kind, &in.ServiceFrom, &in.ServiceTo)
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -660,7 +715,7 @@ func (h *Handlers) DraftContractInput(c *gin.Context) {
 	ownerText := owner.String()
 	in.OwnerID = &ownerText
 	in.Version = &version
-	rows, err := h.Pool.Query(ctx, `SELECT product_id::text,name_on_contract,unit,quantity::text,unit_price::text,tax_rate::text,to_char(due_on,'YYYY-MM-DD') FROM contract_lines WHERE contract_id=$1 ORDER BY line_no`, id)
+	rows, err := h.Pool.Query(ctx, `SELECT product_id::text,name_on_contract,unit,quantity::text,unit_price::text,tax_rate::text,to_char(due_on,'YYYY-MM-DD'),line_type FROM contract_lines WHERE contract_id=$1 ORDER BY line_no`, id)
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -669,7 +724,7 @@ func (h *Handlers) DraftContractInput(c *gin.Context) {
 	in.Lines = []contractLineInput{}
 	for rows.Next() {
 		var l contractLineInput
-		if err := rows.Scan(&l.ProductID, &l.NameOnContract, &l.Unit, &l.Quantity, &l.UnitPrice, &l.TaxRate, &l.DueOn); err != nil {
+		if err := rows.Scan(&l.ProductID, &l.NameOnContract, &l.Unit, &l.Quantity, &l.UnitPrice, &l.TaxRate, &l.DueOn, &l.LineType); err != nil {
 			response.Fail(c, err)
 			return
 		}

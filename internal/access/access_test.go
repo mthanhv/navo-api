@@ -26,3 +26,21 @@ func TestDeliveryRole(t *testing.T) {
 		t.Error("leader is gone and delivery is a role")
 	}
 }
+
+// The sales manager sees and reassigns all sales work, without finance, prices, users or approvals.
+func TestSalesManagerRole(t *testing.T) {
+	p := NewPrincipal(uuid.New(), "Lan", "lan@test.vn", []Role{SalesManager}, nil)
+	for _, perm := range []Permission{ContractsRead, ContractsWrite, ProcurementWrite, FulfillmentWrite, PartnersWrite, ContactsWrite, CatalogWrite} {
+		if !p.Can(perm) {
+			t.Errorf("sales manager should hold %s", perm)
+		}
+	}
+	for _, perm := range []Permission{FinanceRead, FinanceWrite, PurchaseCostRead, UsersManage, QuantityOverride} {
+		if p.Can(perm) {
+			t.Errorf("sales manager must not hold %s", perm)
+		}
+	}
+	if p.OwnerFilter() != nil || !ValidRole("sales_manager") {
+		t.Error("sales manager sees the whole company")
+	}
+}

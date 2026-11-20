@@ -14,6 +14,7 @@ import (
 
 	"navo-api/internal/config"
 	"navo-api/internal/db"
+	"navo-api/internal/notify"
 	"navo-api/internal/router"
 )
 
@@ -60,6 +61,9 @@ func run() error {
 			}
 		}
 	}()
+
+	// Zalo Bot notifications: read the bot's messages, queue and send (off until a token is saved).
+	go notify.New(pool, cfg.ZaloAPIBase, cfg.PublicURL, cfg.Timezone).Run(ctx, 15*time.Second)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

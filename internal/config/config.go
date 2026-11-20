@@ -27,6 +27,9 @@ type Config struct {
 	RequireAdminMFA bool
 	// SMTP enables product-news emails to customers; empty host keeps the feature off.
 	SMTP mailer.Config
+	// ZaloAPIBase is the Zalo Bot API host (tests point it at a fake); PublicURL puts links in messages.
+	ZaloAPIBase string
+	PublicURL   string
 }
 
 // Load reads the environment.
@@ -37,6 +40,8 @@ func Load() (Config, error) {
 		FilesDir:        envOr("NAVO_FILES_DIR", "var/files"),
 		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
 		AIModel:         envOr("NAVO_AI_MODEL", "claude-opus-5-5"),
+		ZaloAPIBase:     envOr("NAVO_ZALO_API_BASE", "https://bot-api.zaloplatforms.com"),
+		PublicURL:       os.Getenv("NAVO_PUBLIC_URL"),
 		SMTP: mailer.Config{Host: os.Getenv("NAVO_SMTP_HOST"), Port: envOr("NAVO_SMTP_PORT", "587"), Username: os.Getenv("NAVO_SMTP_USERNAME"),
 			Password: os.Getenv("NAVO_SMTP_PASSWORD"), From: os.Getenv("NAVO_MAIL_FROM")},
 	}

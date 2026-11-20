@@ -197,7 +197,7 @@ func (h *Handlers) prepare(ctx context.Context, q db.Querier, owner *uuid.UUID, 
 	if len(contactIDs) > 0 {
 		rows, err := q.Query(ctx, `SELECT ct.id, ct.organization_id, ct.full_name, ct.email
 			FROM contacts ct JOIN organizations o ON o.id = ct.organization_id
-			WHERE ct.id = ANY($1) AND o.is_customer AND ct.email IS NOT NULL AND ct.accepts_email AND `+Manageable(2)+`
+			WHERE ct.id = ANY($1) AND (o.is_customer OR o.lead_stage IS NOT NULL) AND ct.email IS NOT NULL AND ct.accepts_email AND `+Manageable(2)+`
 			ORDER BY o.name, ct.full_name, ct.id`, contactIDs, owner)
 		if err != nil {
 			return nil, nil, err
@@ -363,6 +363,12 @@ func (h *Handlers) deliver(id uuid.UUID, senderName, senderEmail string) {
 		if _, err := h.Pool.Exec(ctx, `UPDATE mailing_recipients SET status = 'sent', sent_at = now() WHERE id = $1`, r.id); err != nil {
 			slog.Error("mailing outcome not persisted", "recipient_id", r.id, "error", err)
 			return
+		}
+		// The sales log of that customer or lead shows the email (5.14).
+		if _, err := h.Pool.Exec(ctx, `INSERT INTO activities (kind, status, organization_id, contact_id, summary, done_at, auto, owner_id, created_by)
+			SELECT 'email', 'done', r.organization_id, r.contact_id, left('Email: ' || m.subject, 5000), now(), true, m.created_by, m.created_by
+			FROM mailing_recipients r JOIN mailings m ON m.id = r.mailing_id WHERE r.id = $1`, r.id); err != nil {
+			slog.Warn("mailing activity not recorded", "recipient_id", r.id, "error", err)
 		}
 	}
 	_, _ = h.Pool.Exec(ctx, `UPDATE mailings SET finished_at = now() WHERE id = $1`, id)

@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"navo-api/internal/activitylog"
 	"navo-api/internal/apperrors"
 	"navo-api/internal/audit"
 	"navo-api/internal/auth"
@@ -124,7 +125,7 @@ func (h *Handlers) CreateNote(c *gin.Context) {
 			return err
 		}
 		var author uuid.UUID
-		err := tx.QueryRow(ctx, `SELECT id,author_id FROM notes WHERE client_id=$1`, clientID).Scan(&id, &author)
+		err := tx.QueryRow(ctx, `SELECT id,owner_id FROM activities WHERE client_id=$1`, clientID).Scan(&id, &author)
 		if err == nil {
 			if author != p.UserID {
 				return apperrors.Conflict("note_exists", "This client identity is already in use.", nil)
@@ -156,7 +157,7 @@ func (h *Handlers) CreateNote(c *gin.Context) {
 			return err
 		}
 		var isCustomer bool
-		if err := tx.QueryRow(ctx, `SELECT is_customer FROM organizations WHERE id = $1`, customer).Scan(&isCustomer); err != nil || !isCustomer {
+		if err := tx.QueryRow(ctx, `SELECT `+activitylog.CustomerOrLead+` FROM organizations o WHERE o.id = $1`, customer).Scan(&isCustomer); err != nil || !isCustomer {
 			return apperrors.Invalid("customer_id", "not_customer", nil)
 		}
 		if contract != nil {
@@ -166,18 +167,22 @@ func (h *Handlers) CreateNote(c *gin.Context) {
 				return apperrors.Invalid("contract_id", "not_in_contract", nil)
 			}
 		}
-		if err := tx.QueryRow(ctx, `INSERT INTO notes (client_id, customer_id, contract_id, body, written_at, author_id)
-			VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (client_id) DO NOTHING RETURNING id`, clientID, customer, contract, in.Body, written, p.UserID).Scan(&id); err != nil {
+		// A note is a finished activity of kind "note" (5.14 merged notes and tasks into activities).
+		if err := tx.QueryRow(ctx, `INSERT INTO activities (client_id, kind, status, organization_id, contract_id, summary, done_at, owner_id, created_by)
+			VALUES ($1, 'note', 'done', $2, $3, $4, $5, $6, $6) ON CONFLICT (client_id) DO NOTHING RETURNING id`, clientID, customer, contract, in.Body, written, p.UserID).Scan(&id); err != nil {
 			if err == pgx.ErrNoRows {
 				return apperrors.Rule("note_exists", "This note was already sent.", nil)
 			}
 			return err
 		}
 		if in.Task != nil {
-			if _, err := tx.Exec(ctx, `INSERT INTO tasks (title, due_on, owner_id, customer_id, contract_id, note_id, created_by) VALUES ($1, $2, $3, $4, $5, $6, $3)`,
+			if _, err := tx.Exec(ctx, `INSERT INTO activities (kind, status, summary, planned_on, owner_id, organization_id, contract_id, parent_id, created_by) VALUES ('task', 'planned', $1, $2, $3, $4, $5, $6, $3)`,
 				in.Task.Title, taskDue, p.UserID, customer, contract, id); err != nil {
 				return err
 			}
+		}
+		if err := activitylog.Touched(ctx, tx, customer); err != nil {
+			return err
 		}
 		return audit.Record(ctx, tx, "create", "note", id, map[string]any{"customer_id": customer, "with_task": in.Task != nil})
 	})
@@ -198,15 +203,16 @@ func (h *Handlers) CreateNote(c *gin.Context) {
 	c.JSON(201, gin.H{"request_id": c.GetString("request_id"), "status": 201, "success": true, "data": n})
 }
 
-const noteSelect = `SELECT n.id, n.client_id, n.customer_id, o.name, n.contract_id, c.number, n.body, n.written_at, u.full_name
-	FROM notes n JOIN organizations o ON o.id = n.customer_id JOIN users u ON u.id = n.author_id LEFT JOIN contracts c ON c.id = n.contract_id`
+// noteSelect reads finished activities in the shape of the older notes API (phone app).
+const noteSelect = `SELECT n.id, coalesce(n.client_id, n.id), n.organization_id, o.name, n.contract_id, c.number, n.summary, n.done_at, u.full_name
+	FROM activities n JOIN organizations o ON o.id = n.organization_id JOIN users u ON u.id = n.owner_id LEFT JOIN contracts c ON c.id = n.contract_id`
 
 func (h *Handlers) loadNote(ctx context.Context, q db.Querier, id uuid.UUID) (*Note, error) {
 	var n Note
 	if err := q.QueryRow(ctx, noteSelect+` WHERE n.id = $1`, id).Scan(&n.ID, &n.ClientID, &n.CustomerID, &n.CustomerName, &n.ContractID, &n.ContractNumber, &n.Body, &n.WrittenAt, &n.Author); err != nil {
 		return nil, err
 	}
-	tasks, err := h.tasks(ctx, q, `t.note_id = $1`, id)
+	tasks, err := h.tasks(ctx, q, `t.parent_id = $1`, id)
 	n.Tasks = tasks
 	return &n, err
 }
@@ -215,7 +221,7 @@ func (h *Handlers) loadNote(ctx context.Context, q db.Querier, id uuid.UUID) (*N
 func (h *Handlers) ListNotes(c *gin.Context) {
 	ctx := c.Request.Context()
 	p := auth.Principal(c)
-	where, args := []string{`($1::uuid IS NULL OR n.author_id = $1 OR c.owner_id = $1)`}, []any{p.OwnerFilter()}
+	where, args := []string{`n.status = 'done'`, `($1::uuid IS NULL OR n.owner_id = $1 OR c.owner_id = $1)`}, []any{p.OwnerFilter()}
 	for _, f := range []string{"customer_id", "contract_id"} {
 		if v := c.Query(f); v != "" {
 			id, err := uuid.Parse(v)
@@ -224,10 +230,14 @@ func (h *Handlers) ListNotes(c *gin.Context) {
 				return
 			}
 			args = append(args, id)
-			where = append(where, "n."+f+" = $"+strconv.Itoa(len(args)))
+			col := f
+			if f == "customer_id" {
+				col = "organization_id"
+			}
+			where = append(where, "n."+col+" = $"+strconv.Itoa(len(args)))
 		}
 	}
-	rows, err := h.Pool.Query(ctx, noteSelect+` WHERE `+strings.Join(where, " AND ")+` ORDER BY n.written_at DESC LIMIT 100`, args...)
+	rows, err := h.Pool.Query(ctx, noteSelect+` WHERE `+strings.Join(where, " AND ")+` ORDER BY n.done_at DESC LIMIT 100`, args...)
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -256,9 +266,10 @@ func (h *Handlers) ListNotes(c *gin.Context) {
 }
 
 func (h *Handlers) tasks(ctx context.Context, q db.Querier, where string, args ...any) ([]Task, error) {
-	rows, err := q.Query(ctx, `SELECT t.id, t.title, t.due_on, t.customer_id, o.name, t.contract_id, c.number, t.done_at
-		FROM tasks t LEFT JOIN organizations o ON o.id = t.customer_id LEFT JOIN contracts c ON c.id = t.contract_id
-		WHERE `+where+` ORDER BY t.done_at IS NOT NULL, t.due_on NULLS LAST, t.created_at`, args...)
+	// Tasks are planned activities (any kind: a call or visit to make counts as a task too).
+	rows, err := q.Query(ctx, `SELECT t.id, t.summary, t.planned_on, t.organization_id, o.name, t.contract_id, c.number, t.done_at
+		FROM activities t LEFT JOIN organizations o ON o.id = t.organization_id LEFT JOIN contracts c ON c.id = t.contract_id
+		WHERE `+where+` ORDER BY t.done_at IS NOT NULL, t.planned_on NULLS LAST, t.created_at`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +293,7 @@ func (h *Handlers) tasks(ctx context.Context, q db.Querier, where string, args .
 // MyTasks handles GET /tasks: the caller's open tasks, plus those finished today.
 func (h *Handlers) MyTasks(c *gin.Context) {
 	p := auth.Principal(c)
-	out, err := h.tasks(c.Request.Context(), h.Pool, `t.owner_id = $1 AND (t.done_at IS NULL OR t.done_at > now() - interval '12 hours')`, p.UserID)
+	out, err := h.tasks(c.Request.Context(), h.Pool, `t.owner_id = $1 AND (t.status = 'planned' OR (t.planned_on IS NOT NULL OR t.kind = 'task') AND t.done_at > now() - interval '12 hours')`, p.UserID)
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -337,12 +348,12 @@ func (h *Handlers) CreateTask(c *gin.Context) {
 			customer = &customerID
 		} else if customer != nil {
 			var isCustomer bool
-			if err := tx.QueryRow(ctx, `SELECT is_customer FROM organizations WHERE id = $1`, *customer).Scan(&isCustomer); err != nil || !isCustomer {
+			if err := tx.QueryRow(ctx, `SELECT `+activitylog.CustomerOrLead+` FROM organizations o WHERE o.id = $1`, *customer).Scan(&isCustomer); err != nil || !isCustomer {
 				return nil, apperrors.Invalid("customer_id", "not_customer", nil)
 			}
 		}
 		var id uuid.UUID
-		if err := tx.QueryRow(ctx, `INSERT INTO tasks (title, due_on, owner_id, customer_id, contract_id, created_by) VALUES ($1, $2, $3, $4, $5, $3) RETURNING id`,
+		if err := tx.QueryRow(ctx, `INSERT INTO activities (kind, status, summary, planned_on, owner_id, organization_id, contract_id, created_by) VALUES ('task', 'planned', $1, $2, $3, $4, $5, $3) RETURNING id`,
 			in.Title, due, p.UserID, customer, contract).Scan(&id); err != nil {
 			return nil, err
 		}
@@ -365,7 +376,8 @@ func (h *Handlers) SetTaskDone(done bool) gin.HandlerFunc {
 		}
 		httpx.Command(c, h.Pool, "tasks.state", false, 200, func(tx pgx.Tx) (any, error) {
 			ctx := c.Request.Context()
-			tag, err := tx.Exec(ctx, `UPDATE tasks SET done_at = CASE WHEN $3 THEN coalesce(done_at, now()) END WHERE id = $1 AND owner_id = $2`, id, p.UserID, done)
+			tag, err := tx.Exec(ctx, `UPDATE activities SET done_at = CASE WHEN $3 THEN coalesce(done_at, now()) END, status = CASE WHEN $3 THEN 'done' ELSE 'planned' END, updated_at = now()
+				WHERE id = $1 AND owner_id = $2`, id, p.UserID, done)
 			if err != nil {
 				return nil, err
 			}

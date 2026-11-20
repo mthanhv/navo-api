@@ -90,9 +90,10 @@ func resolveOwner(ctx context.Context, q db.Querier, p *access.Principal, ownerT
 			WHERE q.id = $1 AND ($2::uuid IS NULL OR q.owner_id = $2)`
 	case OwnerNote:
 		// Notes: the author, whoever owns the note's contract, and people who see everyone.
-		sql = `SELECT n.customer_id, cu.code, n.contract_id, 'note' FROM notes n JOIN organizations cu ON cu.id = n.customer_id
+		// Notes are activities now (migration 023); any activity can carry photos.
+		sql = `SELECT n.organization_id, cu.code, n.contract_id, 'note' FROM activities n JOIN organizations cu ON cu.id = n.organization_id
 			LEFT JOIN contracts c ON c.id = n.contract_id
-			WHERE n.id = $1 AND ($2::uuid IS NULL OR n.author_id = $2 OR c.owner_id = $2)`
+			WHERE n.id = $1 AND ($2::uuid IS NULL OR n.owner_id = $2 OR c.owner_id = $2)`
 	case OwnerReceipt:
 		sql = `SELECT d.customer_id, cu.code, NULL::uuid, d.number FROM receipts d JOIN organizations cu ON cu.id = d.customer_id WHERE d.id = $1 AND $2::uuid IS NULL`
 	case OwnerPurchaseInvoice:

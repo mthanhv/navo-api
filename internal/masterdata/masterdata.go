@@ -212,7 +212,7 @@ func (h *Handlers) ListOrganizations(c *gin.Context) {
 	items := []Organization{}
 	total := 0
 	rows, err := h.Pool.Query(c.Request.Context(), orgSelect(5)+`, count(*) OVER () `+orgFrom+`
-		WHERE ($1 = '' OR ($1 = 'customer' AND o.is_customer) OR ($1 = 'supplier' AND o.is_supplier))
+		WHERE ($1 = '' OR ($1 = 'customer' AND o.is_customer) OR ($1 = 'supplier' AND o.is_supplier) OR ($1 = 'prospect' AND (o.is_customer OR (o.lead_stage IS NOT NULL AND o.lead_stage <> 'lost'))))
 		  AND ($2 = '' OR o.code ILIKE '%' || $2 || '%' OR o.name ILIKE '%' || $2 || '%'
 		       OR EXISTS (SELECT 1 FROM contacts ct WHERE ct.organization_id = o.id AND (ct.full_name ILIKE '%' || $2 || '%' OR ct.email ILIKE '%' || $2 || '%' OR ct.phone ILIKE '%' || $2 || '%')))
 		ORDER BY o.name, o.id LIMIT $3 OFFSET $4`, role, q, size, (page-1)*size, auth.Principal(c).OwnerFilter())
@@ -564,6 +564,11 @@ func suggestCode(ctx context.Context, q interface {
 		}
 	}
 	return "", apperrors.Rule("code_unavailable", "No free code; type one.", nil)
+}
+
+// GenerateCode is suggestCode for other packages (leads get a code from their name too).
+func GenerateCode(ctx context.Context, tx pgx.Tx, name string) (string, error) {
+	return suggestCode(ctx, tx, name, true)
 }
 
 // SuggestCode handles GET /organizations/suggest-code?name=&role=customer|supplier.

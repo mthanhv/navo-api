@@ -10,16 +10,18 @@ import "github.com/google/uuid"
 type Role string
 
 const (
-	Sales      Role = "sales"
-	Delivery   Role = "delivery"
-	Accounting Role = "accounting"
-	Admin      Role = "admin"
+	Sales    Role = "sales"
+	Delivery Role = "delivery"
+	// SalesManager runs the sales team: whole-company sales work and reports, no finance or users (2026-11-20).
+	SalesManager Role = "sales_manager"
+	Accounting   Role = "accounting"
+	Admin        Role = "admin"
 )
 
 // ValidRole reports whether r is a known role.
 func ValidRole(r string) bool {
 	switch Role(r) {
-	case Sales, Delivery, Accounting, Admin:
+	case Sales, SalesManager, Delivery, Accounting, Admin:
 		return true
 	}
 	return false
@@ -55,9 +57,10 @@ var Grantable = map[Permission]bool{PurchaseCostRead: true, FinanceRead: true, Q
 var roleDefaults = map[Role][]Permission{
 	Sales: {ContractsRead, ContractsWrite, ProcurementWrite, FulfillmentWrite, FulfillmentConfirm, PartnersWrite, ContactsWrite, CatalogWrite, ReportsOperations},
 	// Delivery receives goods and delivers to customers on every contract; no contract edits, ordering, prices or finance.
-	Delivery:   {ContractsRead, FulfillmentWrite, FulfillmentConfirm, ReportsOperations},
-	Accounting: {ContractsRead, PurchaseCostRead, FinanceRead, FinanceWrite},
-	Admin:      all,
+	Delivery:     {ContractsRead, FulfillmentWrite, FulfillmentConfirm, ReportsOperations},
+	SalesManager: {ContractsRead, ContractsWrite, ProcurementWrite, FulfillmentWrite, FulfillmentConfirm, PartnersWrite, ContactsWrite, CatalogWrite, ReportsOperations},
+	Accounting:   {ContractsRead, PurchaseCostRead, FinanceRead, FinanceWrite},
+	Admin:        all,
 }
 
 // all is every permission; the admin role holds it.
@@ -88,7 +91,7 @@ func NewPrincipal(id uuid.UUID, name, email string, roles []Role, grants []strin
 			p.perms[perm] = true
 		}
 		// Delivery, accounting and admin read the whole company; sales read their own (REQUIREMENTS 2).
-		if r == Delivery || r == Accounting || r == Admin {
+		if r == Delivery || r == SalesManager || r == Accounting || r == Admin {
 			p.seesAll = true
 		}
 	}

@@ -26,6 +26,7 @@ import (
 	"navo-api/internal/masterdata"
 	"navo-api/internal/middleware"
 	"navo-api/internal/misa"
+	"navo-api/internal/notify"
 	"navo-api/internal/response"
 	"navo-api/internal/users"
 )
@@ -226,6 +227,19 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 	a.POST("/misa/import", need(access.FinanceWrite), ms.Import)
 
 	// Starting master data (customers, suppliers, products): preview, then commit.
+	// Settings page and Zalo Bot notifications (REQUIREMENTS 5.15 / 1.9).
+	nt := &notify.Handlers{Svc: notify.New(pool, cfg.ZaloAPIBase, cfg.PublicURL, cfg.Timezone)}
+	a.GET("/settings", need(access.UsersManage), nt.Get)
+	a.PATCH("/settings/company", need(access.UsersManage), nt.UpdateCompany)
+	a.PUT("/settings/zalo", need(access.UsersManage), nt.ConnectZalo)
+	a.DELETE("/settings/zalo", need(access.UsersManage), nt.DisconnectZalo)
+	a.PATCH("/settings/notifications", need(access.UsersManage), nt.UpdateNotifications)
+	a.PATCH("/zalo-chats/:id", need(access.UsersManage), nt.RenameChat)
+	a.DELETE("/zalo-chats/:id", need(access.UsersManage), nt.RemoveChat)
+	a.POST("/zalo-chats/:id/test", need(access.UsersManage), nt.TestChat)
+	a.GET("/me/zalo", nt.MyZalo)
+	a.POST("/me/zalo/code", nt.MyZaloCode)
+	a.DELETE("/me/zalo", nt.UnlinkMyZalo)
 	imp := &imports.Handlers{Pool: pool}
 	a.GET("/imports/:kind/template", need(access.ContractsRead), imp.Template)
 	// Item lines from Excel for the contract and quotation forms (read only, 2026-11-20).

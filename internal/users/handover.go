@@ -43,7 +43,7 @@ func (h *Handlers) HandoverPreview(c *gin.Context) {
 		response.Fail(c, err)
 		return
 	}
-	rows, err = h.Pool.Query(ctx, `SELECT id,title FROM tasks WHERE owner_id=$1 AND done_at IS NULL ORDER BY id`, from)
+	rows, err = h.Pool.Query(ctx, `SELECT id,summary FROM activities WHERE owner_id=$1 AND status='planned' ORDER BY id`, from)
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -148,13 +148,13 @@ func (h *Handlers) Handover(c *gin.Context) {
 		if count != len(ids) {
 			return nil, apperrors.Conflict("version_conflict", "The selected assignments changed. Reload the preview.", nil)
 		}
-		if _, err := tx.Exec(ctx, `SELECT id FROM tasks WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE`, tasks); err != nil {
+		if _, err := tx.Exec(ctx, `SELECT id FROM activities WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE`, tasks); err != nil {
 			return nil, err
 		}
 		// A task linked to an unselected contract cannot be moved independently to a
 		// salesperson who could not see it after the handover.
 		var invalid bool
-		if err := tx.QueryRow(ctx, `SELECT count(*)<>$3 OR coalesce(bool_or(contract_id IS NOT NULL AND contract_id<>ALL($4::uuid[]) AND NOT EXISTS(SELECT 1 FROM contracts c WHERE c.id=t.contract_id AND c.owner_id=$2)),false) FROM tasks t WHERE t.id=ANY($1::uuid[]) AND t.owner_id=$5 AND t.done_at IS NULL`, tasks, to, len(tasks), ids, from).Scan(&invalid); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT count(*)<>$3 OR coalesce(bool_or(contract_id IS NOT NULL AND contract_id<>ALL($4::uuid[]) AND NOT EXISTS(SELECT 1 FROM contracts c WHERE c.id=t.contract_id AND c.owner_id=$2)),false) FROM activities t WHERE t.id=ANY($1::uuid[]) AND t.owner_id=$5 AND t.status='planned'`, tasks, to, len(tasks), ids, from).Scan(&invalid); err != nil {
 			return nil, err
 		}
 		if invalid {
@@ -163,7 +163,7 @@ func (h *Handlers) Handover(c *gin.Context) {
 		if _, err := tx.Exec(ctx, `UPDATE contracts SET owner_id=$2,version=version+1,updated_at=now() WHERE id=ANY($1)`, ids, to); err != nil {
 			return nil, err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE tasks SET owner_id=$2 WHERE id=ANY($1)`, tasks, to); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE activities SET owner_id=$2, updated_at=now() WHERE id=ANY($1)`, tasks, to); err != nil {
 			return nil, err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE organizations SET owner_id=$2,version=version+1 WHERE owner_id=$1 AND id IN (SELECT customer_id FROM contracts WHERE id=ANY($3))`, from, to, ids); err != nil {

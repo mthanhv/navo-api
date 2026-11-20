@@ -178,7 +178,7 @@ func (h *Handlers) ListContacts(c *gin.Context) {
 // ListEmailContacts handles GET /contacts/emailable: contacts of customers the caller looks
 // after that have an address and have not asked to stop product news — who a mailing may go to.
 func (h *Handlers) ListEmailContacts(c *gin.Context) {
-	rows, err := h.Pool.Query(c.Request.Context(), contactSelect+` WHERE o.is_customer AND ct.email IS NOT NULL AND ct.accepts_email AND `+Manageable(1)+`
+	rows, err := h.Pool.Query(c.Request.Context(), contactSelect+` WHERE (o.is_customer OR o.lead_stage IS NOT NULL) AND ct.email IS NOT NULL AND ct.accepts_email AND `+Manageable(1)+`
 		ORDER BY o.name, ct.is_primary DESC, ct.full_name, ct.id LIMIT 2000`, auth.Principal(c).OwnerFilter())
 	if err != nil {
 		response.Fail(c, err)
@@ -197,7 +197,7 @@ func (h *Handlers) ListEmailContacts(c *gin.Context) {
 // Suppliers are shared. A customer belongs to its owner, the owners of its open contracts,
 // and anyone who sees the whole company; an unassigned customer is open to all
 // (owner decision 2026-11-11: shared read, owner writes).
-const manageableSQL = `(NOT o.is_customer OR $%[1]d::uuid IS NULL OR o.owner_id IS NULL OR o.owner_id = $%[1]d
+const manageableSQL = `(NOT (o.is_customer OR o.lead_stage IS NOT NULL) OR $%[1]d::uuid IS NULL OR o.owner_id IS NULL OR o.owner_id = $%[1]d
 	OR EXISTS (SELECT 1 FROM contracts mc WHERE mc.customer_id = o.id AND mc.owner_id = $%[1]d AND mc.status IN ('draft', 'active')))`
 
 // Manageable returns manageableSQL bound to placeholder n.

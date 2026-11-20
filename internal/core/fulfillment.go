@@ -362,6 +362,16 @@ func (h *Handlers) CreateDeliveryOrder(c *gin.Context) {
 		if k.Status != "active" {
 			return nil, apperrors.Rule("contract_not_active", "Activate the contract before planning deliveries.", map[string]any{"status": k.Status})
 		}
+		// Services are done by service visits, never delivered.
+		for i, l := range lines {
+			var service bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM contract_lines WHERE id = $1 AND line_type = 'service')`, l.contractLine).Scan(&service); err != nil {
+				return nil, err
+			}
+			if service {
+				return nil, apperrors.Invalid(fmt.Sprintf("lines[%d].contract_line_id", i), "service_line", nil)
+			}
+		}
 		number, err := numbering.NextChild(ctx, tx, contractID, "DO")
 		if err != nil {
 			return nil, err

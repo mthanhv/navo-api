@@ -312,7 +312,7 @@ func TestOperationalCorrections(t *testing.T) {
 		}
 		e.must(200, e.do(successor, "GET", "/api/v1/contracts/"+cid, nil, nil), "successor contract")
 		var author, taskOwner string
-		if err := e.pool.QueryRow(context.Background(), `SELECT n.author_id,t.owner_id FROM notes n JOIN tasks t ON t.note_id=n.id WHERE t.id=$1`, taskID).Scan(&author, &taskOwner); err != nil {
+		if err := e.pool.QueryRow(context.Background(), `SELECT n.owner_id,t.owner_id FROM activities n JOIN activities t ON t.parent_id=n.id WHERE t.id=$1`, taskID).Scan(&author, &taskOwner); err != nil {
 			t.Fatal(err)
 		}
 		if author != from || taskOwner != to {

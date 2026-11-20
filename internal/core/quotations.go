@@ -12,6 +12,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"navo-api/internal/access"
+	"navo-api/internal/activitylog"
 	"navo-api/internal/apperrors"
 	"navo-api/internal/audit"
 	"navo-api/internal/auth"
@@ -54,7 +55,11 @@ type Quotation struct {
 	CreatedAt      time.Time       `json:"created_at"`
 	Lines          []QuotationLine `json:"lines,omitempty"`
 	// Detail only: the seller's name for the printed quotation.
-	CompanyName string `json:"company_name,omitempty"`
+	CompanyName    string  `json:"company_name,omitempty"`
+	CompanyTaxCode *string `json:"company_tax_code,omitempty"`
+	CompanyAddress *string `json:"company_address,omitempty"`
+	CompanyPhone   *string `json:"company_phone,omitempty"`
+	CompanyEmail   *string `json:"company_email,omitempty"`
 }
 
 // QuotationLine is one offered item; the name is the wording printed for the customer.
@@ -121,7 +126,7 @@ func (h *Handlers) loadQuotation(ctx context.Context, q db.Querier, id uuid.UUID
 	if err != nil {
 		return nil, err
 	}
-	if err := q.QueryRow(ctx, `SELECT name FROM company_settings`).Scan(&out.CompanyName); err != nil {
+	if err := q.QueryRow(ctx, `SELECT name, tax_code, address, phone, email FROM company_settings`).Scan(&out.CompanyName, &out.CompanyTaxCode, &out.CompanyAddress, &out.CompanyPhone, &out.CompanyEmail); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -298,8 +303,9 @@ func (h *Handlers) saveQuotation(c *gin.Context, editing bool) {
 	}
 	httpx.Command(c, h.Pool, scope, false, status, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
+		// A lead (not yet a customer) can receive a quotation too (5.14).
 		var isCustomer bool
-		if err := tx.QueryRow(ctx, `SELECT is_customer FROM organizations WHERE id=$1`, customerID).Scan(&isCustomer); err != nil || !isCustomer {
+		if err := tx.QueryRow(ctx, `SELECT `+activitylog.CustomerOrLead+` FROM organizations o WHERE o.id=$1`, customerID).Scan(&isCustomer); err != nil || !isCustomer {
 			return nil, apperrors.Invalid("customer_id", "not_customer", nil)
 		}
 		if contactID != nil {
@@ -425,6 +431,20 @@ func (h *Handlers) QuotationStatus(to string) gin.HandlerFunc {
 			}
 			if _, err := tx.Exec(ctx, sql, args...); err != nil {
 				return nil, err
+			}
+			if to == "send" {
+				// The sales log shows the quotation went out, and a lead moves to "quoted".
+				var org, owner uuid.UUID
+				var number string
+				if err := tx.QueryRow(ctx, `SELECT customer_id, owner_id, number FROM quotations WHERE id=$1`, id).Scan(&org, &owner, &number); err != nil {
+					return nil, err
+				}
+				if err := activitylog.Auto(ctx, tx, "email", org, nil, &id, owner, p.UserID, "Đã gửi báo giá "+number); err != nil {
+					return nil, err
+				}
+				if err := activitylog.Quoted(ctx, tx, org); err != nil {
+					return nil, err
+				}
 			}
 			if err := audit.Record(ctx, tx, to, "quotation", id, map[string]any{"from": st, "reason": in.Reason}); err != nil {
 				return nil, err

@@ -45,7 +45,7 @@ type result struct {
 func (r result) data() map[string]any { m, _ := r.Body["data"].(map[string]any); return m }
 func (r result) reason() string       { s, _ := r.Body["reason"].(string); return s }
 
-func setup(t *testing.T) *env {
+func setup(t *testing.T, opts ...func(*config.Config)) *env {
 	t.Helper()
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
@@ -69,7 +69,11 @@ func setup(t *testing.T) *env {
 	}
 	loc, _ := time.LoadLocation("Asia/Ho_Chi_Minh")
 	outbox := &outbox{}
-	srv := httptest.NewServer(router.NewWithMailer(config.Config{SessionTTL: time.Hour, Timezone: loc, FilesDir: t.TempDir()}, pool, outbox))
+	cfg := config.Config{SessionTTL: time.Hour, Timezone: loc, FilesDir: t.TempDir()}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	srv := httptest.NewServer(router.NewWithMailer(cfg, pool, outbox))
 	t.Cleanup(func() { srv.Close(); pool.Close() })
 	return &env{t: t, srv: srv, pool: pool, mail: outbox}
 }

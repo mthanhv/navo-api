@@ -184,6 +184,13 @@ func (h *Handlers) CreatePurchaseOrder(c *gin.Context) {
 			if !ok {
 				lineErrs.Add(fmt.Sprintf("lines[%d].contract_line_id", i), "not_in_contract", nil)
 			}
+			var service bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM contract_lines WHERE id = $1 AND line_type = 'service')`, l.contractLine).Scan(&service); err != nil {
+				return nil, err
+			}
+			if service {
+				lineErrs.Add(fmt.Sprintf("lines[%d].contract_line_id", i), "service_line", nil)
+			}
 		}
 		if err := lineErrs.Err(); err != nil {
 			return nil, err
