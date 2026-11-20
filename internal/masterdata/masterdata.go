@@ -4,6 +4,7 @@ package masterdata
 import (
 	"context"
 	"errors"
+	"net/mail"
 	"regexp"
 	"strconv"
 	"strings"
@@ -37,12 +38,16 @@ var (
 
 // Organization is a customer and/or supplier.
 type Organization struct {
-	ID         uuid.UUID `json:"id"`
-	Code       string    `json:"code"`
-	Name       string    `json:"name"`
-	IsCustomer bool      `json:"is_customer"`
-	IsSupplier bool      `json:"is_supplier"`
-	TaxCode    *string   `json:"tax_code"`
+	ID                 uuid.UUID `json:"id"`
+	Code               string    `json:"code"`
+	Name               string    `json:"name"`
+	IsCustomer         bool      `json:"is_customer"`
+	IsSupplier         bool      `json:"is_supplier"`
+	TaxCode            *string   `json:"tax_code"`
+	InvoiceCompanyName *string   `json:"invoice_company_name"`
+	InvoiceTaxCode     *string   `json:"invoice_tax_code"`
+	InvoiceAddress     *string   `json:"invoice_address"`
+	InvoiceEmail       *string   `json:"invoice_email"`
 	// Contacts is how many people are recorded; PrimaryContact is the main one, for lists.
 	Contacts       int     `json:"contacts"`
 	PrimaryContact *string `json:"primary_contact"`
@@ -56,11 +61,15 @@ type Organization struct {
 }
 
 type organizationInput struct {
-	Code       string  `json:"code"`
-	Name       string  `json:"name"`
-	IsCustomer bool    `json:"is_customer"`
-	IsSupplier bool    `json:"is_supplier"`
-	TaxCode    *string `json:"tax_code"`
+	Code               string  `json:"code"`
+	Name               string  `json:"name"`
+	IsCustomer         bool    `json:"is_customer"`
+	IsSupplier         bool    `json:"is_supplier"`
+	TaxCode            *string `json:"tax_code"`
+	InvoiceCompanyName *string `json:"invoice_company_name"`
+	InvoiceTaxCode     *string `json:"invoice_tax_code"`
+	InvoiceAddress     *string `json:"invoice_address"`
+	InvoiceEmail       *string `json:"invoice_email"`
 	// OwnerID: absent keeps the owner; "" clears it. Only people who see the whole
 	// company may set it; a salesperson creating a customer becomes its owner.
 	OwnerID *string `json:"owner_id"`
@@ -125,6 +134,35 @@ func (in *organizationInput) validate() error {
 	if in.TaxCode != nil && *in.TaxCode == "" {
 		in.TaxCode = nil
 	}
+	in.InvoiceCompanyName = blankToNil(in.InvoiceCompanyName)
+	in.InvoiceTaxCode = blankToNil(in.InvoiceTaxCode)
+	in.InvoiceAddress = blankToNil(in.InvoiceAddress)
+	in.InvoiceEmail = blankToNil(in.InvoiceEmail)
+	for _, field := range []struct {
+		name  string
+		value *string
+		max   int
+	}{
+		{"invoice_company_name", in.InvoiceCompanyName, 300},
+		{"invoice_address", in.InvoiceAddress, 300},
+	} {
+		if field.value != nil && len([]rune(*field.value)) > field.max {
+			errs.Add(field.name, "too_long", map[string]any{"max": field.max})
+		}
+	}
+	if in.InvoiceTaxCode != nil && !taxCode.MatchString(*in.InvoiceTaxCode) {
+		errs.Add("invoice_tax_code", "tax_code", nil)
+	}
+	if in.InvoiceEmail != nil {
+		address, err := mail.ParseAddress(*in.InvoiceEmail)
+		if err != nil || address.Address != *in.InvoiceEmail || len(*in.InvoiceEmail) > 254 ||
+			!strings.Contains((*in.InvoiceEmail)[strings.LastIndex(*in.InvoiceEmail, "@")+1:], ".") {
+			errs.Add("invoice_email", "email", nil)
+		} else {
+			lower := strings.ToLower(*in.InvoiceEmail)
+			in.InvoiceEmail = &lower
+		}
+	}
 	if len(in.Contacts) > 50 {
 		errs.Add("contacts", "too_many", map[string]any{"max": 50})
 	}
@@ -157,8 +195,10 @@ func (h *Handlers) CreateOrganization(c *gin.Context) {
 			}
 		}
 		var id uuid.UUID
-		err = tx.QueryRow(ctx, `INSERT INTO organizations (code, name, is_customer, is_supplier, tax_code, owner_id)
-			VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`, in.Code, in.Name, in.IsCustomer, in.IsSupplier, in.TaxCode, owner).Scan(&id)
+		err = tx.QueryRow(ctx, `INSERT INTO organizations
+			(code, name, is_customer, is_supplier, tax_code, invoice_company_name, invoice_tax_code, invoice_address, invoice_email, owner_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+			in.Code, in.Name, in.IsCustomer, in.IsSupplier, in.TaxCode, in.InvoiceCompanyName, in.InvoiceTaxCode, in.InvoiceAddress, in.InvoiceEmail, owner).Scan(&id)
 		if err != nil {
 			if appErr := apperrors.From(err); appErr.Reason == "duplicate" {
 				return nil, apperrors.Invalid("code", "taken", nil)
@@ -186,13 +226,15 @@ func (h *Handlers) CreateOrganization(c *gin.Context) {
 // caller's owner filter (for can_manage_contacts).
 func orgSelect(n int) string {
 	return `SELECT o.id, o.code, o.name, o.is_customer, o.is_supplier, o.tax_code,
+	o.invoice_company_name, o.invoice_tax_code, o.invoice_address, o.invoice_email,
 	(SELECT count(*) FROM contacts ct WHERE ct.organization_id = o.id), pc.full_name, pc.phone, pc.email, o.owner_id, ou.full_name, ` + crm.Manageable(n)
 }
 
 const orgFrom = `FROM organizations o LEFT JOIN contacts pc ON pc.organization_id = o.id AND pc.is_primary LEFT JOIN users ou ON ou.id = o.owner_id`
 
 func (o *Organization) dest() []any {
-	return []any{&o.ID, &o.Code, &o.Name, &o.IsCustomer, &o.IsSupplier, &o.TaxCode, &o.Contacts, &o.PrimaryContact, &o.PrimaryPhone, &o.PrimaryEmail,
+	return []any{&o.ID, &o.Code, &o.Name, &o.IsCustomer, &o.IsSupplier, &o.TaxCode, &o.InvoiceCompanyName, &o.InvoiceTaxCode, &o.InvoiceAddress, &o.InvoiceEmail,
+		&o.Contacts, &o.PrimaryContact, &o.PrimaryPhone, &o.PrimaryEmail,
 		&o.OwnerID, &o.OwnerName, &o.CanManageContacts}
 }
 
@@ -466,8 +508,10 @@ func (h *Handlers) UpdateOrganization(c *gin.Context) {
 		if err := errs.Err(); err != nil {
 			return nil, err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE organizations SET code = $2, name = $3, is_customer = $4, is_supplier = $5, tax_code = $6, owner_id = $7,
-				version = version + 1, updated_at = now() WHERE id = $1`, id, in.Code, in.Name, in.IsCustomer, in.IsSupplier, in.TaxCode, owner); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE organizations SET code = $2, name = $3, is_customer = $4, is_supplier = $5, tax_code = $6,
+				invoice_company_name = $7, invoice_tax_code = $8, invoice_address = $9, invoice_email = $10, owner_id = $11,
+				version = version + 1, updated_at = now() WHERE id = $1`, id, in.Code, in.Name, in.IsCustomer, in.IsSupplier, in.TaxCode,
+			in.InvoiceCompanyName, in.InvoiceTaxCode, in.InvoiceAddress, in.InvoiceEmail, owner); err != nil {
 			if appErr := apperrors.From(err); appErr.Reason == "duplicate" {
 				return nil, apperrors.Invalid("code", "taken", nil)
 			}

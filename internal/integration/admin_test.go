@@ -62,12 +62,35 @@ func TestAccountsAndCorrections(t *testing.T) {
 	sales = e.do("", "POST", "/api/v1/auth/login", map[string]any{"email": "khoa@test.vn", "password": "temporary-pass-9", "client": "mobile"}, nil).data()["token"].(string)
 
 	// Partner and product corrections.
-	cust := e.must(201, e.do(sales, "POST", "/api/v1/organizations", map[string]any{"code": "STRA", "name": "Song Tra", "is_customer": true}, nil), "customer")
+	cust := e.must(201, e.do(sales, "POST", "/api/v1/organizations", map[string]any{"code": "STRA", "name": "Song Tra", "is_customer": true,
+		"invoice_company_name": "Song Tra JSC", "invoice_tax_code": "0101234567", "invoice_address": "1 Main Street",
+		"invoice_email": "AP@STRA.VN"}, nil), "customer")
+	if cust["invoice_company_name"] != "Song Tra JSC" || cust["invoice_tax_code"] != "0101234567" ||
+		cust["invoice_address"] != "1 Main Street" || cust["invoice_email"] != "ap@stra.vn" {
+		t.Fatalf("invoice details not saved on create: %v", cust)
+	}
 	sup := e.must(201, e.do(sales, "POST", "/api/v1/organizations", map[string]any{"code": "DGA", "name": "Đông Á", "is_supplier": true}, nil), "supplier")
 	prod := e.must(201, e.do(sales, "POST", "/api/v1/products", map[string]any{"name": "Van bi", "unit": "bo"}, nil), "product")
 	fixed := e.must(200, e.do(sales, "PATCH", "/api/v1/organizations/"+cust["id"].(string), map[string]any{"code": "STRA", "name": "Lọc hóa dầu Sông Trà", "is_customer": true, "tax_code": "0101234567"}, nil), "fix customer")
 	if fixed["name"] != "Lọc hóa dầu Sông Trà" {
 		t.Fatalf("customer fix: %v", fixed)
+	}
+	if fixed["invoice_company_name"] != nil || fixed["invoice_tax_code"] != nil || fixed["invoice_address"] != nil || fixed["invoice_email"] != nil {
+		t.Fatalf("omitted invoice fields are cleared on update: %v", fixed)
+	}
+	invoice := e.must(200, e.do(sales, "PATCH", "/api/v1/organizations/"+cust["id"].(string), map[string]any{
+		"code": "STRA", "name": "Lọc hóa dầu Sông Trà", "is_customer": true, "tax_code": "0101234567",
+		"invoice_company_name": "Lọc hóa dầu Sông Trà", "invoice_tax_code": "0101234567",
+		"invoice_address": "1 Main Street", "invoice_email": "AP@STRA.VN",
+	}, nil), "update customer invoice details")
+	if invoice["invoice_company_name"] != "Lọc hóa dầu Sông Trà" || invoice["invoice_tax_code"] != "0101234567" ||
+		invoice["invoice_address"] != "1 Main Street" || invoice["invoice_email"] != "ap@stra.vn" {
+		t.Fatalf("invoice details not saved and normalized: %v", invoice)
+	}
+	if r := e.do(sales, "PATCH", "/api/v1/organizations/"+cust["id"].(string), map[string]any{
+		"code": "STRA", "name": "Lọc hóa dầu Sông Trà", "is_customer": true, "invoice_tax_code": "bad",
+	}, nil); r.Status != 400 {
+		t.Fatalf("invalid invoice tax code: %d %v", r.Status, r.Body)
 	}
 	if e.must(200, e.do(sales, "PATCH", "/api/v1/products/"+prod["id"].(string), map[string]any{"name": "Van bi DN50", "unit": "bộ"}, nil), "fix product")["unit"] != "bộ" {
 		t.Fatal("product fix")
