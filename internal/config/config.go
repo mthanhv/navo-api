@@ -45,6 +45,11 @@ func Load() (Config, error) {
 		SMTP: mailer.Config{Host: os.Getenv("NAVO_SMTP_HOST"), Port: envOr("NAVO_SMTP_PORT", "587"), Username: os.Getenv("NAVO_SMTP_USERNAME"),
 			Password: os.Getenv("NAVO_SMTP_PASSWORD"), From: os.Getenv("NAVO_MAIL_FROM")},
 	}
+	allowInsecure, err := strconv.ParseBool(envOr("NAVO_SMTP_ALLOW_INSECURE", "false"))
+	if err != nil {
+		return cfg, fmt.Errorf("NAVO_SMTP_ALLOW_INSECURE must be true or false")
+	}
+	cfg.SMTP.AllowInsecure = allowInsecure
 	if _, err := mailer.New(cfg.SMTP); err != nil {
 		return cfg, err
 	}

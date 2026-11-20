@@ -23,6 +23,26 @@ plan, a late PO, an under-ordered line; SC-26-0002 (Đạm Phương Nam) overdue
 For a single real account use `NAVO_USER_PASSWORD=… make user EMAIL=… NAME=… ROLES=…`.
 Start over: `dropdb navo_dev && createdb navo_dev && make migrate && make seed`.
 
+### Local email with Mailpit
+
+From `../navo-infra`, run `make local-mailpit`, then set these values in the API `.env`
+and restart `make run`:
+
+```dotenv
+NAVO_SMTP_HOST=127.0.0.1
+NAVO_SMTP_PORT=1025
+NAVO_SMTP_USERNAME=
+NAVO_SMTP_PASSWORD=
+NAVO_SMTP_ALLOW_INSECURE=true
+NAVO_MAIL_FROM=navo@example.test
+```
+
+Send a product-news email from the app and inspect recipients, subject and body at
+http://localhost:8025. Mailpit captures messages instead of delivering them to customers.
+The full Docker stack (`../navo-infra: make local-up`) configures this automatically.
+Use `NAVO_SMTP_ALLOW_INSECURE` only for local capture servers; it defaults to false.
+Existing integration tests use an in-memory sender and do not need Mailpit.
+
 ## API (v1, increment A1–A2)
 
 All bodies are JSON; quantities and money are decimal strings (`"60"`, `"980.50"`).

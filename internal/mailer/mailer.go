@@ -45,6 +45,8 @@ type Config struct {
 	Password string
 	// From is "Company name <address@company.vn>" or a bare address.
 	From string
+	// AllowInsecure permits plaintext SMTP for local capture servers such as Mailpit.
+	AllowInsecure bool
 }
 
 // SMTP sends through one SMTP account.
@@ -84,7 +86,7 @@ func (s *SMTP) From() string {
 	return s.from.Address
 }
 
-// Send delivers one message, with TLS (implicit on 465, STARTTLS otherwise).
+// Send delivers one message, with TLS (implicit on 465, STARTTLS otherwise, unless plaintext is explicitly allowed).
 func (s *SMTP) Send(ctx context.Context, m Message) error {
 	if !s.Enabled() {
 		return errors.New("email is not set up")
@@ -121,7 +123,7 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 			if err := c.StartTLS(tlsCfg); err != nil {
 				return err
 			}
-		} else if !isLocal(s.cfg.Host) {
+		} else if !s.cfg.AllowInsecure && !isLocal(s.cfg.Host) {
 			return errors.New("the mail server does not offer TLS")
 		}
 	}
