@@ -221,7 +221,7 @@ func (h *Handlers) loadNote(ctx context.Context, q db.Querier, id uuid.UUID) (*N
 func (h *Handlers) ListNotes(c *gin.Context) {
 	ctx := c.Request.Context()
 	p := auth.Principal(c)
-	where, args := []string{`n.status = 'done'`, `($1::uuid IS NULL OR n.owner_id = $1 OR c.owner_id = $1)`}, []any{p.OwnerFilter()}
+	where, args := []string{`n.status = 'done' AND n.kind = 'note' AND NOT n.auto`, `($1::uuid IS NULL OR n.owner_id = $1 OR c.owner_id = $1)`}, []any{p.OwnerFilter()}
 	for _, f := range []string{"customer_id", "contract_id"} {
 		if v := c.Query(f); v != "" {
 			id, err := uuid.Parse(v)
@@ -377,7 +377,7 @@ func (h *Handlers) SetTaskDone(done bool) gin.HandlerFunc {
 		httpx.Command(c, h.Pool, "tasks.state", false, 200, func(tx pgx.Tx) (any, error) {
 			ctx := c.Request.Context()
 			tag, err := tx.Exec(ctx, `UPDATE activities SET done_at = CASE WHEN $3 THEN coalesce(done_at, now()) END, status = CASE WHEN $3 THEN 'done' ELSE 'planned' END, updated_at = now()
-				WHERE id = $1 AND owner_id = $2`, id, p.UserID, done)
+				WHERE id = $1 AND owner_id = $2 AND kind = 'task'`, id, p.UserID, done)
 			if err != nil {
 				return nil, err
 			}

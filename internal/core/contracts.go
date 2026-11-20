@@ -214,6 +214,9 @@ func (h *Handlers) saveContract(c *gin.Context, editing bool) {
 	if in.Kind != nil && *in.Kind != "" {
 		kind = *in.Kind
 	}
+	if kind == "service" {
+		errs.Add("kind", "service_unavailable", nil)
+	}
 	if kind != "supply" && kind != "service" {
 		errs.Add("kind", "one_of", map[string]any{"values": []string{"supply", "service"}})
 	}

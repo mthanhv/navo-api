@@ -196,11 +196,11 @@ type visitInput struct {
 }
 
 type parsedVisit struct {
-	kind, urgency      string
-	planned            *time.Time
-	assignee, equip    *uuid.UUID
-	description        *string
-	lines              []parsedVisitLine
+	kind, urgency   string
+	planned         *time.Time
+	assignee, equip *uuid.UUID
+	description     *string
+	lines           []parsedVisitLine
 }
 
 type parsedVisitLine struct {

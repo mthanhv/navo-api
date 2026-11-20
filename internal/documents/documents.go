@@ -155,12 +155,12 @@ func ext(name string) string {
 func (h *Handlers) Upload(c *gin.Context) {
 	ctx := c.Request.Context()
 	p := auth.Principal(c)
-	if !canWriteFiles(p) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxUpload+1<<20)
+	ownerType, docKind := c.PostForm("owner_type"), c.PostForm("doc_kind")
+	if !canWriteFiles(p, ownerType) {
 		response.Fail(c, apperrors.Forbidden("files.write"))
 		return
 	}
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxUpload+1<<20)
-	ownerType, docKind := c.PostForm("owner_type"), c.PostForm("doc_kind")
 	var errs apperrors.FieldErrors
 	var clientID *uuid.UUID
 	if raw := c.PostForm("client_id"); raw != "" {
@@ -348,7 +348,7 @@ func (h *Handlers) visibleLinks(ctx context.Context, p *access.Principal, where 
 			continue
 		}
 		l.SharedWith = numbersOf(ctx, h.Pool, shared[l.LinkID])
-		l.CanRemove = canWriteFiles(p) && (l.CreatedBy == p.UserID || p.Can(access.ContractsWrite))
+		l.CanRemove = canWriteFiles(p, l.OwnerType) && (l.CreatedBy == p.UserID || p.Can(access.ContractsWrite))
 		out = append(out, l.FileItem)
 	}
 	return out, nil
@@ -389,7 +389,7 @@ func (h *Handlers) OwnerFiles(c *gin.Context) {
 			return
 		}
 	}
-	response.OK(c, gin.H{"items": items, "kinds": kinds, "can_write": canWriteFiles(p), "max_mb": MaxUpload >> 20})
+	response.OK(c, gin.H{"items": items, "kinds": kinds, "can_write": canWriteFiles(p, ownerType), "max_mb": MaxUpload >> 20})
 }
 
 // Download handles GET /files/:id?link=: the bytes of a file the caller may see through
@@ -488,10 +488,6 @@ func safeName(s string) string {
 // bytes stay (other links and backups may still need them).
 func (h *Handlers) Unlink(c *gin.Context) {
 	p := auth.Principal(c)
-	if !canWriteFiles(p) {
-		response.Fail(c, apperrors.Forbidden("files.write"))
-		return
-	}
 	id, err := httpx.PathID(c, "id")
 	if err != nil {
 		response.Fail(c, err)
@@ -505,6 +501,9 @@ func (h *Handlers) Unlink(c *gin.Context) {
 			FROM attachment_links l JOIN files f ON f.id = l.file_id WHERE l.id = $1 FOR UPDATE OF l`, id).
 			Scan(&ownerType, &ownerID, &docKind, &fileID, &createdBy, &name); err != nil {
 			return nil, err
+		}
+		if !canWriteFiles(p, ownerType) {
+			return nil, apperrors.Forbidden("files.write")
 		}
 		if !Visible(p, ownerType, docKind) {
 			return nil, apperrors.NotFound()

@@ -28,11 +28,12 @@ func New(pool *pgxpool.Pool, base, publicURL string, tz *time.Location) *Service
 
 // Service reads the bot's incoming messages, queues notifications and sends them.
 type Service struct {
-	Pool      *pgxpool.Pool
-	Zalo      Zalo
-	TZ        *time.Location
-	PublicURL string // links in messages; empty leaves them out
-	Now       func() time.Time
+	Pool                 *pgxpool.Pool
+	Zalo                 Zalo
+	TZ                   *time.Location
+	PublicURL            string // links in messages; empty leaves them out
+	Now                  func() time.Time
+	authorizationVersion int64
 }
 
 func (s *Service) now() time.Time {
@@ -63,19 +64,24 @@ type settings struct {
 	digest, quietFrom, quietTo time.Duration
 	lastDigest                 *time.Time
 	offset                     int64
+	authorizationVersion       int64
 }
 
 // RunOnce handles incoming messages, queues what is due, and sends what is pending.
 func (s *Service) RunOnce(ctx context.Context) error {
 	var st settings
-	err := s.Pool.QueryRow(ctx, `SELECT zalo_token, extract(epoch FROM digest_time)::bigint, extract(epoch FROM quiet_from)::bigint, extract(epoch FROM quiet_to)::bigint, last_digest_on, update_offset
-		FROM notification_settings`).Scan(&st.token, ptrSecs(&st.digest), ptrSecs(&st.quietFrom), ptrSecs(&st.quietTo), &st.lastDigest, &st.offset)
+	err := s.Pool.QueryRow(ctx, `SELECT zalo_token, extract(epoch FROM digest_time)::bigint, extract(epoch FROM quiet_from)::bigint, extract(epoch FROM quiet_to)::bigint, last_digest_on, update_offset, authorization_version
+		FROM notification_settings`).Scan(&st.token, ptrSecs(&st.digest), ptrSecs(&st.quietFrom), ptrSecs(&st.quietTo), &st.lastDigest, &st.offset, &st.authorizationVersion)
 	if err != nil {
 		return err
 	}
 	if st.token == nil {
 		return nil
 	}
+	// Each tick renders against one version. Never stamp old content with newer access.
+	run := *s
+	run.authorizationVersion = st.authorizationVersion
+	s = &run
 	token := *st.token
 	if err := s.readUpdates(ctx, token, st.offset); err != nil {
 		s.recordError(ctx, err)
@@ -90,7 +96,7 @@ func (s *Service) RunOnce(ctx context.Context) error {
 		if err := s.queueDaily(ctx, today); err != nil {
 			return err
 		}
-		if _, err := s.Pool.Exec(ctx, `UPDATE notification_settings SET last_digest_on = $1`, today); err != nil {
+		if _, err := s.Pool.Exec(ctx, `UPDATE notification_settings SET last_digest_on = $1 WHERE authorization_version=$2`, today, s.authorizationVersion); err != nil {
 			return err
 		}
 	}
@@ -208,8 +214,11 @@ func (s *Service) enqueue(ctx context.Context, rule, key string, chat uuid.UUID,
 	if len([]rune(body)) > 2000 {
 		body = string([]rune(body)[:1990]) + "…"
 	}
-	_, err := s.Pool.Exec(ctx, `INSERT INTO notifications (dedupe_key, rule, chat_id, body) VALUES ($1, $2, $3, $4) ON CONFLICT (dedupe_key) DO NOTHING`,
-		key+":"+chat.String(), rule, chat, body)
+	_, err := s.Pool.Exec(ctx, `INSERT INTO notifications (dedupe_key, rule, chat_id, body, authorization_version)
+ SELECT $1,$2,$3,$4,$5 FROM notification_settings WHERE authorization_version=$5
+ ON CONFLICT (dedupe_key) DO UPDATE SET body=EXCLUDED.body, authorization_version=EXCLUDED.authorization_version,
+ status='pending', attempts=0, error=NULL WHERE notifications.status='failed' AND notifications.error='access_changed'`,
+		key+":"+chat.String(), rule, chat, body, s.authorizationVersion)
 	return err
 }
 
@@ -572,6 +581,24 @@ func (s *Service) sendPending(ctx context.Context, token string) error {
 	}
 	rows.Close()
 	for _, m := range list {
+		// Recheck after loading the batch too: an offboarding/handover can invalidate
+		// messages while another network send in this batch is in flight.
+		var eligible bool
+		if err := s.Pool.QueryRow(ctx, `SELECT EXISTS(
+   SELECT 1 FROM notifications n JOIN zalo_chats c ON c.id=n.chat_id
+   JOIN notification_rules r ON r.key=n.rule CROSS JOIN notification_settings st
+   LEFT JOIN users u ON u.id=c.user_id
+   WHERE n.id=$1 AND n.status='pending' AND n.authorization_version=st.authorization_version
+   AND st.zalo_token=$2 AND r.enabled
+   AND ((c.kind='person' AND u.is_active AND r.to_people) OR (c.kind='group' AND r.group_id=c.id)))`, m.id, token).Scan(&eligible); err != nil {
+			return err
+		}
+		if !eligible {
+			if _, err := s.Pool.Exec(ctx, `UPDATE notifications SET status='failed',error='access_changed' WHERE id=$1 AND status='pending'`, m.id); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := s.Zalo.Send(ctx, token, m.chat, m.body); err != nil {
 			s.recordError(ctx, err)
 			if _, err := s.Pool.Exec(ctx, `UPDATE notifications SET attempts = attempts + 1, error = $2, status = CASE WHEN attempts + 1 >= 3 THEN 'failed' ELSE 'pending' END WHERE id = $1`, m.id, err.Error()); err != nil {

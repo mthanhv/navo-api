@@ -328,10 +328,14 @@ func (h *Handlers) Allocate(c *gin.Context) {
 		for i, w := range wants {
 			ids[i] = w.milestone
 		}
+		// Serialize cancellation/amendments with collection before locking terms.
+		if _, err := tx.Exec(ctx, `SELECT c.id FROM contracts c WHERE c.id IN (SELECT contract_id FROM payment_milestones WHERE id=ANY($1)) ORDER BY c.id FOR UPDATE`, ids); err != nil {
+			return nil, err
+		}
 		if _, err := tx.Exec(ctx, `SELECT 1 FROM payment_milestones WHERE id = ANY($1) ORDER BY id FOR UPDATE`, ids); err != nil {
 			return nil, err
 		}
-		ms, err := h.loadMilestones(ctx, tx, `m.id = ANY($1)`, true, ids)
+		ms, err := h.loadMilestones(ctx, tx, `m.id = ANY($1) AND c.status IN ('active', 'closed')`, true, ids)
 		if err != nil {
 			return nil, err
 		}

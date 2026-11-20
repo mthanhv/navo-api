@@ -115,4 +115,29 @@ Implemented: contract drafts/activation and draft editing; PO/GR/DO creation, co
 
 See [reliability and API details](docs/RELIABILITY.md), [assessment baseline](docs/PRODUCT_REVIEW_2026-11-10.md), [remediation status and release limits](docs/REMEDIATION.md), and [the 11 November review and fixes](docs/REVIEW_2026-11-11.md).
 
-Partial physical returns, active commercial amendments, contract close/cancel, opening-data onboarding/import, real-MISA template acceptance, and a maintained OpenAPI schema remain incomplete. Do not infer these from status columns or historical requirements. There is no subscription billing or tenant model: one business uses each installation.
+Opening balances, in-progress contract onboarding, real-MISA template acceptance, and a maintained OpenAPI schema remain incomplete. Returns, active amendments and contract close/cancel are implemented. Do not infer these from status columns or historical requirements. There is no subscription billing or tenant model: one business uses each installation.
+
+
+## Product review fixes (20 November 2026)
+
+- Acceptance terms synchronize when quantities or payment terms change, including terms
+  added after acceptance. Changes that invalidate an already allocated acceptance are refused.
+- Receipt allocation locks the source contracts and accepts only active/closed contracts.
+  Receivable summaries consistently honor `customer_id`.
+- `POST /misa/import` previews catalogue matches without writing. Confirm by reuploading the
+  file with multipart `confirm=true` and the returned `preview_hash`. The server rechecks
+  the matches; changed previews return `misa_preview_changed`. Conflicting tax IDs never
+  fall back to a name match. Name-only matches require the same explicit review.
+- Service-contract creation is gated with field error `service_unavailable` until the service
+  fulfillment workflow is released. Supply contracts remain supported.
+- Delivery staff may upload GR/DO evidence and remove their own attachments, without gaining
+  contract/finance file writes. The legacy notes endpoint returns manual notes only.
+- Pending Zalo messages are invalidated after permission, assignment, or rule changes. The
+  next tick rebuilds daily messages and rechecks eligibility before sending queued content.
+- Pending migrations apply as one transaction. Migration 025 restores and synchronizes the
+  legacy `notes`/`tasks` tables for rollback images; 023 remains immutable. Keep these adapters
+  while any supported image uses the legacy schema. A deployment from before 023 must use
+  this migration runner so the temporary dropped-table schema is never committed.
+
+Run `make check` and `make -e test-integration` with a dedicated UTF-8 test database.
+Regression coverage is in `internal/integration/product_review_test.go`.

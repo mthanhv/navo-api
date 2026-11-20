@@ -15,13 +15,13 @@ These rules implement the conservative choices approved on 11 November 2026. All
 | `POST /api/v1/payments/:id/allocations` | `{purchase_invoice_id,amount}` | Posted payment, supplier/currency match, recorded invoice. Both available payment and outstanding invoice limits are checked after separate locks. |
 | `GET /api/v1/payments/:id/allocations` | — | Includes reversed allocation history. |
 | `POST /api/v1/payment-allocations/:id/reverse` | `{reason}` | Reverses an allocation without deleting the original. |
-| `POST /api/v1/milestones/:id/trigger` | `{on,note}` | Acceptance/manual only; required evidence reference, nonfuture date, active contract, once only. Acceptance requires full confirmed delivery on/before the supplied date. |
+| `POST /api/v1/milestones/:id/trigger` | `{on,note}` | Manual events only; required evidence reference, nonfuture date, active contract, once only. Acceptance terms are synchronized exclusively from acceptance documents. |
 | `POST /api/v1/milestones/:id/reset` | `{reason}` | Explicit correction of a recorded manual/acceptance event; blocks live allocations; versioned history preserved. |
 | `PATCH /api/v1/milestones/:id` | Complete term input plus `version` | Matching version; untriggered, no invoice/allocation history; draft/active contract only. |
 | `GET /api/v1/handovers/preview?from_user=:id` | — | Admin preview of draft/active contracts and open tasks. |
 | `POST /api/v1/handovers` | `{from_user,to_user,reason,contracts:[{id,version}],task_ids:[]}` | Admin, active sales/admin successor, selected current assignments only. Linked tasks require successor contract access. Ownership transfers atomically, authorship is retained, old command replay is invalidated. |
 
-Correction and handover commands require an `Idempotency-Key`. Reasons are required (1–500 characters). Route permissions continue to apply; full receipt/delivery reversal uses fulfillment confirmation permission, cash uses finance write, PO close uses procurement write. File upload/unlink requires contract write or finance write plus existing resource/field visibility.
+Correction and handover commands require an `Idempotency-Key`. Reasons are required (1–500 characters). Route permissions continue to apply; full receipt/delivery reversal uses fulfillment confirmation permission, cash uses finance write, PO close uses procurement write. File upload/unlink requires contract write or finance write plus existing resource/field visibility; fulfillment writers may also attach GR/DO evidence and remove their own GR/DO attachments.
 
 Creation endpoints accept an optional `Idempotency-Key`. Contract creation can include `milestones` and creates header, lines and terms in one transaction. A new create request with the same key must have the same payload. Stored command results are bound to the caller's resolved permission/scope revision; changed or legacy authorization returns `idempotency_authorization_changed` without repeating the effect. Read the current resource after that conflict.
 
@@ -35,7 +35,7 @@ MISA export generation and marking occur in one transaction. Each new batch stor
 
 ## Operational boundaries
 
-Readiness checks all required migration versions as well as database connectivity; additional expand-only versions are allowed for rollback. Apply migrations 011–014 before using these changes. Back up and reconcile existing money data before rollout: historic over-allocation is not silently rewritten.
+Readiness checks all required migration versions as well as database connectivity; additional expand-only versions are allowed for rollback. Apply all migrations with the current runner as one atomic batch. Migration 025 restores writable legacy CRM tables and synchronizes them with activities; do not deploy 023 alone. Back up and reconcile existing money data before rollout: historic over-allocation is not silently rewritten.
 
 AI extraction persists successful results by actor/source hash/model before reply, allows one running request per actor/two globally, and caps attempts at 50 per rolling day. Retries of completed sources reuse results. Expired running jobs fail after five minutes; provider retries are disabled. This is bounded synchronous extraction with recovery, not a general async worker. The source document is attached by the web after draft creation; a failed attachment remains visible/retryable.
 

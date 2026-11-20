@@ -297,6 +297,9 @@ func (h *Handlers) CreateMilestone(c *gin.Context) {
 		if status == "cancelled" || status == "closed" {
 			return nil, apperrors.Rule("contract_not_open", "Payment terms can be changed only on draft or active contracts.", nil)
 		}
+		if _, err := tx.Exec(ctx, `SELECT id FROM contract_lines WHERE contract_id=$1 ORDER BY id FOR UPDATE`, id); err != nil {
+			return nil, err
+		}
 		var mid uuid.UUID
 		if err := tx.QueryRow(ctx, `INSERT INTO payment_milestones (contract_id, seq, name, percent, amount, trigger, days_after, fixed_due_on, created_by)
 			VALUES ($1, coalesce((SELECT max(seq) FROM payment_milestones WHERE contract_id = $1), 0) + 1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
@@ -304,6 +307,9 @@ func (h *Handlers) CreateMilestone(c *gin.Context) {
 			return nil, err
 		}
 		if err := audit.Record(ctx, tx, "create", "payment_milestone", mid, map[string]any{"name": in.Name, "amount": amount.String(), "trigger": in.Trigger}); err != nil {
+			return nil, err
+		}
+		if err := SyncAcceptanceTerms(ctx, tx, id, p.UserID); err != nil {
 			return nil, err
 		}
 		ms, err := h.loadMilestones(ctx, tx, `m.id = $1`, p.Can(access.FinanceRead), mid)
@@ -346,6 +352,13 @@ func (h *Handlers) UpdateMilestone(c *gin.Context) {
 	}
 	httpx.Command(c, h.Pool, "milestones.update", false, 200, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
+		var contractID uuid.UUID
+		if err := tx.QueryRow(ctx, `SELECT c.id FROM payment_milestones m JOIN contracts c ON c.id=m.contract_id WHERE m.id=$1 AND ($2::uuid IS NULL OR c.owner_id=$2) FOR UPDATE OF c`, id, scopeFor(p)).Scan(&contractID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `SELECT id FROM contract_lines WHERE contract_id=$1 ORDER BY id FOR UPDATE`, contractID); err != nil {
+			return nil, err
+		}
 		var version int64
 		var status string
 		if err := tx.QueryRow(ctx, `SELECT m.version,c.status FROM payment_milestones m JOIN contracts c ON c.id=m.contract_id WHERE m.id=$1 AND ($2::uuid IS NULL OR c.owner_id=$2) FOR UPDATE OF m`, id, scopeFor(p)).Scan(&version, &status); err != nil {
@@ -381,6 +394,9 @@ func (h *Handlers) UpdateMilestone(c *gin.Context) {
 			return nil, err
 		}
 		if err := audit.Record(ctx, tx, "update", "payment_milestone", id, map[string]any{"name": in.Name, "amount": amount.String(), "trigger": in.Trigger}); err != nil {
+			return nil, err
+		}
+		if err := SyncAcceptanceTerms(ctx, tx, contractID, p.UserID); err != nil {
 			return nil, err
 		}
 		ms, err := h.loadMilestones(ctx, tx, `m.id = $1`, p.Can(access.FinanceRead), id)
@@ -538,12 +554,14 @@ func (h *Handlers) Receivables(c *gin.Context) {
 	tab := c.DefaultQuery("tab", "late")
 	where := `c.status IN ('active', 'closed')`
 	args := []any{}
+	var customer *uuid.UUID
 	if cust := c.Query("customer_id"); cust != "" {
 		id, err := uuid.Parse(cust)
 		if err != nil {
 			response.Fail(c, apperrors.Invalid("customer_id", "uuid", nil))
 			return
 		}
+		customer = &id
 		where += ` AND c.customer_id = $1`
 		args = append(args, id)
 	}
@@ -581,7 +599,7 @@ func (h *Handlers) Receivables(c *gin.Context) {
 		JOIN LATERAL (SELECT coalesce(sum(round(cl.quantity * cl.unit_price, 2)), 0) AS value FROM contract_lines cl WHERE cl.contract_id = c.id) v ON true
 		LEFT JOIN LATERAL (SELECT sum(a.amount) AS paid FROM receipt_allocations a JOIN payment_milestones m ON m.id = a.milestone_id
 			WHERE m.contract_id = c.id AND a.reversed_at IS NULL) p ON true
-		WHERE c.status IN ('active', 'closed') GROUP BY c.currency`)
+		WHERE c.status IN ('active', 'closed') AND ($1::uuid IS NULL OR c.customer_id=$1) GROUP BY c.currency`, customer)
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -597,7 +615,7 @@ func (h *Handlers) Receivables(c *gin.Context) {
 	}
 	vrows.Close()
 	urows, err := h.Pool.Query(ctx, `SELECT r.currency, sum(r.amount - coalesce((SELECT sum(a.amount) FROM receipt_allocations a WHERE a.receipt_id = r.id AND a.reversed_at IS NULL), 0))::text
-		FROM receipts r WHERE r.status = 'posted' GROUP BY r.currency`)
+		FROM receipts r WHERE r.status = 'posted' AND ($1::uuid IS NULL OR r.customer_id=$1) GROUP BY r.currency`, customer)
 	if err != nil {
 		response.Fail(c, err)
 		return

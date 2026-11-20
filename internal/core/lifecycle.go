@@ -407,6 +407,9 @@ func (h *Handlers) AmendContract(c *gin.Context) {
 				touched = append(touched, lid)
 			}
 		}
+		if err := finance.SyncAcceptanceTerms(ctx, tx, id, p.UserID); err != nil {
+			return nil, err
+		}
 		if err := touchLines(ctx, tx, touched); err != nil {
 			return nil, err
 		}

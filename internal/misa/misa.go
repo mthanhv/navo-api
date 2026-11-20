@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 	"unicode"
@@ -449,6 +450,9 @@ func (h *Handlers) SetCode(c *gin.Context) {
 	}
 	httpx.Command(c, h.Pool, "misa.code", false, 200, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('misa_catalogue'))`); err != nil {
+			return nil, err
+		}
 		tag, err := tx.Exec(ctx, `UPDATE `+table+` SET misa_code = $2 WHERE id = $1`, id, in.Code)
 		if err != nil {
 			if apperrors.From(err).Reason == "duplicate" {
@@ -472,10 +476,11 @@ func normalize(s string) string {
 }
 
 // Import handles POST /misa/import (multipart "file"): a catalogue exported from MISA
-// (customers, suppliers or products). Navo finds the header row, matches each entry by tax
-// code, then by name, and stores the MISA code where none is set. Nothing else changes.
+// (customers, suppliers or products). Preview first; commit requires the exact preview
+// hash and rechecks current matches. A conflicting tax identity is never matched by name.
 func (h *Handlers) Import(c *gin.Context) {
 	ctx := c.Request.Context()
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 11<<20)
 	fh, err := c.FormFile("file")
 	if err != nil {
 		response.Fail(c, apperrors.Invalid("file", "required", nil))
@@ -538,75 +543,195 @@ func (h *Handlers) Import(c *gin.Context) {
 		response.Fail(c, apperrors.Rule("misa_file_unknown", "This file does not look like a MISA customer, supplier or product list.", nil))
 		return
 	}
-	var matched, already int
-	unmatched := []string{}
+
+	commit := c.PostForm("confirm") == "true"
+	expected := c.PostForm("preview_hash")
+	var result catalogueResult
 	err = db.InTx(ctx, h.Pool, func(tx pgx.Tx) error {
-		for _, r := range rows[header+1:] {
-			get := func(i int) string {
-				if i >= 0 && i < len(r) {
-					return strings.TrimSpace(r[i])
-				}
-				return ""
-			}
-			code, name, tax := get(codeCol), get(nameCol), get(taxCol)
-			if code == "" || name == "" {
+		// Serialize catalogue code assignments, including manual code changes.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('misa_catalogue'))`); err != nil {
+			return err
+		}
+		var err error
+		result, err = previewCatalogue(ctx, tx, kind, rows[header+1:], header+2, codeCol, nameCol, taxCol)
+		if err != nil {
+			return err
+		}
+		if !commit {
+			return nil
+		}
+		if expected == "" || expected != result.PreviewHash {
+			return apperrors.Conflict("misa_preview_changed", "Preview this file again before confirming its matches.", nil)
+		}
+		table := "organizations"
+		if kind == "product" {
+			table = "products"
+		}
+		for _, row := range result.Rows {
+			if row.Outcome != "new" {
 				continue
 			}
-			var sql string
-			var args []any
-			if kind == "product" {
-				sql, args = `SELECT id, misa_code FROM products WHERE lower(name) = lower($1) LIMIT 2`, []any{name}
-			} else {
-				flag := map[string]string{"customer": "is_customer", "supplier": "is_supplier"}[kind]
-				sql, args = `SELECT id, misa_code FROM organizations WHERE `+flag+` AND (($1 <> '' AND tax_code = $1) OR lower(name) = lower($2)) LIMIT 2`, []any{tax, name}
-			}
-			rs, err := tx.Query(ctx, sql, args...)
+			tag, err := tx.Exec(ctx, `UPDATE `+table+` SET misa_code=$2 WHERE id=$1 AND misa_code IS NULL`, row.MatchID, row.Code)
 			if err != nil {
 				return err
 			}
-			type hit struct {
-				id   uuid.UUID
-				code *string
+			if tag.RowsAffected() != 1 {
+				return apperrors.Conflict("misa_preview_changed", "A match changed. Preview again.", nil)
 			}
-			var hits []hit
-			for rs.Next() {
-				var x hit
-				if err := rs.Scan(&x.id, &x.code); err != nil {
-					rs.Close()
-					return err
-				}
-				hits = append(hits, x)
-			}
-			rs.Close()
-			if len(hits) != 1 {
-				unmatched = append(unmatched, name)
-				continue
-			}
-			if hits[0].code != nil {
-				already++
-				continue
-			}
-			table := map[bool]string{true: "products", false: "organizations"}[kind == "product"]
-			tag, err := tx.Exec(ctx, `UPDATE `+table+` SET misa_code = $2 WHERE id = $1 AND misa_code IS NULL
-				AND NOT EXISTS (SELECT 1 FROM `+table+` WHERE misa_code = $2)`, hits[0].id, code)
-			if err != nil {
+			if err := audit.Record(ctx, tx, "misa_code", map[bool]string{true: "product", false: "organization"}[kind == "product"], *row.MatchID, map[string]any{"code": row.Code, "basis": row.Basis}); err != nil {
 				return err
-			}
-			if tag.RowsAffected() == 1 {
-				matched++
-			} else {
-				unmatched = append(unmatched, name)
 			}
 		}
-		return audit.Record(ctx, tx, "import", "misa_catalogue", uuid.Nil, map[string]any{"kind": kind, "matched": matched, "unmatched": len(unmatched)})
+		result.Preview = false
+		return audit.Record(ctx, tx, "import", "misa_catalogue", uuid.Nil, map[string]any{"kind": kind, "matched": result.Matched, "unmatched": len(result.Unmatched)})
 	})
 	if err != nil {
 		response.Fail(c, err)
 		return
 	}
-	if len(unmatched) > 50 {
-		unmatched = unmatched[:50]
+	response.OK(c, result)
+}
+
+type catalogueRow struct {
+	Line        int        `json:"line"`
+	Code        string     `json:"code"`
+	Name        string     `json:"name"`
+	TaxCode     string     `json:"tax_code"`
+	Outcome     string     `json:"outcome"` // new, exists, conflict, unmatched
+	Basis       string     `json:"basis"`   // tax_code, name
+	MatchID     *uuid.UUID `json:"match_id,omitempty"`
+	MatchName   string     `json:"match_name,omitempty"`
+	CurrentCode *string    `json:"current_code,omitempty"`
+}
+type catalogueResult struct {
+	Kind        string         `json:"kind"`
+	Matched     int            `json:"matched"`
+	Already     int            `json:"already"`
+	Unmatched   []string       `json:"unmatched"`
+	Rows        []catalogueRow `json:"rows"`
+	Preview     bool           `json:"preview"`
+	PreviewHash string         `json:"preview_hash"`
+}
+
+func previewCatalogue(ctx context.Context, tx pgx.Tx, kind string, rows [][]string, firstLine, codeCol, nameCol, taxCol int) (catalogueResult, error) {
+	result := catalogueResult{Kind: kind, Preview: true, Rows: []catalogueRow{}, Unmatched: []string{}}
+	table := "organizations"
+	if kind == "product" {
+		table = "products"
 	}
-	_ = auth.Principal(c)
-	response.OK(c, gin.H{"kind": kind, "matched": matched, "already": already, "unmatched": unmatched})
+	type hit struct {
+		id        uuid.UUID
+		name      string
+		tax, code *string
+	}
+	for i, cells := range rows {
+		get := func(col int) string {
+			if col >= 0 && col < len(cells) {
+				return strings.TrimSpace(cells[col])
+			}
+			return ""
+		}
+		row := catalogueRow{Line: firstLine + i, Code: get(codeCol), Name: get(nameCol), TaxCode: get(taxCol), Outcome: "unmatched"}
+		if row.Code == "" && row.Name == "" {
+			continue
+		}
+		if row.Code == "" || row.Name == "" || len(row.Code) > 50 {
+			row.Outcome = "conflict"
+			result.Rows = append(result.Rows, row)
+			continue
+		}
+		find := func(byTax bool) ([]hit, error) {
+			query := `SELECT id,name,NULL::text,misa_code FROM products WHERE lower(name)=lower($1) ORDER BY id LIMIT 2 FOR UPDATE`
+			arg := row.Name
+			if kind != "product" {
+				flag := map[string]string{"customer": "is_customer", "supplier": "is_supplier"}[kind]
+				condition := `lower(name)=lower($1)`
+				if byTax {
+					condition = `tax_code=$1`
+					arg = row.TaxCode
+				}
+				query = `SELECT id,name,tax_code,misa_code FROM organizations WHERE ` + flag + ` AND ` + condition + ` ORDER BY id LIMIT 2 FOR UPDATE`
+			}
+			rs, err := tx.Query(ctx, query, arg)
+			if err != nil {
+				return nil, err
+			}
+			return pgx.CollectRows(rs, func(r pgx.CollectableRow) (hit, error) {
+				var h hit
+				err := r.Scan(&h.id, &h.name, &h.tax, &h.code)
+				return h, err
+			})
+		}
+		var hits []hit
+		var err error
+		if kind != "product" && row.TaxCode != "" {
+			hits, err = find(true)
+			row.Basis = "tax_code"
+		}
+		if err != nil {
+			return result, err
+		}
+		if len(hits) == 0 {
+			hits, err = find(false)
+			row.Basis = "name"
+		}
+		if err != nil {
+			return result, err
+		}
+		if len(hits) == 1 {
+			h := hits[0]
+			row.MatchID = &h.id
+			row.MatchName = h.name
+			row.CurrentCode = h.code
+			switch {
+			case row.TaxCode != "" && h.tax != nil && *h.tax != "" && *h.tax != row.TaxCode:
+				row.Outcome = "conflict"
+			case h.code != nil && *h.code == row.Code:
+				row.Outcome = "exists"
+			case h.code != nil:
+				row.Outcome = "conflict"
+			default:
+				var used bool
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM `+table+` WHERE misa_code=$1)`, row.Code).Scan(&used); err != nil {
+					return result, err
+				}
+				if used {
+					row.Outcome = "conflict"
+				} else {
+					row.Outcome = "new"
+				}
+			}
+		} else if len(hits) > 1 {
+			row.Outcome = "conflict"
+		}
+		result.Rows = append(result.Rows, row)
+	}
+	// Two proposed assignments must never compete for an identity or code.
+	ids, codes := map[uuid.UUID]int{}, map[string]int{}
+	for _, r := range result.Rows {
+		if r.Outcome == "new" {
+			ids[*r.MatchID]++
+			codes[r.Code]++
+		}
+	}
+	for i := range result.Rows {
+		r := &result.Rows[i]
+		if r.Outcome == "new" && (ids[*r.MatchID] > 1 || codes[r.Code] > 1) {
+			r.Outcome = "conflict"
+		}
+		switch r.Outcome {
+		case "new":
+			result.Matched++
+		case "exists":
+			result.Already++
+		default:
+			result.Unmatched = append(result.Unmatched, r.Name)
+		}
+	}
+	raw, err := json.Marshal(result.Rows)
+	if err != nil {
+		return result, err
+	}
+	result.PreviewHash = fmt.Sprintf("%x", sha256.Sum256(append([]byte(kind+"\n"), raw...)))
+	return result, nil
 }

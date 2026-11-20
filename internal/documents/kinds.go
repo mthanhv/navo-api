@@ -4,8 +4,11 @@ package documents
 
 import "navo-api/internal/access"
 
-func canWriteFiles(p *access.Principal) bool {
-	return p.Can(access.ContractsWrite) || p.Can(access.FinanceWrite)
+func canWriteFiles(p *access.Principal, ownerType string) bool {
+	if p.Can(access.ContractsWrite) || p.Can(access.FinanceWrite) {
+		return true
+	}
+	return p.Can(access.FulfillmentWrite) && (ownerType == OwnerGoodsReceipt || ownerType == OwnerDeliveryOrder)
 }
 
 // Owner types a file can be attached to.

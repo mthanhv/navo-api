@@ -48,31 +48,31 @@ func (h *Handlers) today() time.Time {
 
 // Lead is a potential customer with what sales knows and what happened last and next.
 type Lead struct {
-	ID              uuid.UUID  `json:"id"`
-	Code            string     `json:"code"`
-	Name            string     `json:"name"`
-	TaxCode         *string    `json:"tax_code"`
-	IsCustomer      bool       `json:"is_customer"`
-	Stage           string     `json:"stage"`
-	Source          *string    `json:"source"`
-	Industry        *string    `json:"industry"`
-	Interest        *string    `json:"interest"`
-	EstimatedValue  *string    `json:"estimated_value"`
-	LostReason      *string    `json:"lost_reason"`
-	RemindOn        *string    `json:"remind_on"`
-	OwnerID         *uuid.UUID `json:"owner_id"`
-	OwnerName       *string    `json:"owner_name"`
-	LeadSince       time.Time  `json:"lead_since"`
-	WonAt           *time.Time `json:"won_at"`
-	Contacts        int        `json:"contacts"`
-	PrimaryContact  *string    `json:"primary_contact"`
-	PrimaryPhone    *string    `json:"primary_phone"`
-	LastActivityAt  *time.Time `json:"last_activity_at"`
-	LastActivity    *string    `json:"last_activity_kind"`
-	NextPlannedOn   *string    `json:"next_planned_on"`
-	NextPlanned     *string    `json:"next_planned"`
-	Version         int64      `json:"version"`
-	CanEdit         bool       `json:"can_edit"`
+	ID             uuid.UUID  `json:"id"`
+	Code           string     `json:"code"`
+	Name           string     `json:"name"`
+	TaxCode        *string    `json:"tax_code"`
+	IsCustomer     bool       `json:"is_customer"`
+	Stage          string     `json:"stage"`
+	Source         *string    `json:"source"`
+	Industry       *string    `json:"industry"`
+	Interest       *string    `json:"interest"`
+	EstimatedValue *string    `json:"estimated_value"`
+	LostReason     *string    `json:"lost_reason"`
+	RemindOn       *string    `json:"remind_on"`
+	OwnerID        *uuid.UUID `json:"owner_id"`
+	OwnerName      *string    `json:"owner_name"`
+	LeadSince      time.Time  `json:"lead_since"`
+	WonAt          *time.Time `json:"won_at"`
+	Contacts       int        `json:"contacts"`
+	PrimaryContact *string    `json:"primary_contact"`
+	PrimaryPhone   *string    `json:"primary_phone"`
+	LastActivityAt *time.Time `json:"last_activity_at"`
+	LastActivity   *string    `json:"last_activity_kind"`
+	NextPlannedOn  *string    `json:"next_planned_on"`
+	NextPlanned    *string    `json:"next_planned"`
+	Version        int64      `json:"version"`
+	CanEdit        bool       `json:"can_edit"`
 }
 
 const leadSelect = `SELECT o.id, o.code, o.name, o.tax_code, o.is_customer, o.lead_stage, o.lead_source, o.industry, o.interest, o.estimated_value::text,
