@@ -738,3 +738,10 @@ func (h *Handlers) ResetMilestone(c *gin.Context) {
 		return gin.H{"id": id, "reset": true}, audit.Record(ctx, tx, "reset_event", "payment_milestone", id, map[string]any{"reason": in.Reason})
 	})
 }
+
+// ContractMilestones loads the payment terms of the given contracts with their due dates and
+// status, exactly as Receivables works them out (the delivery calendar shows them on its lanes).
+func ContractMilestones(ctx context.Context, q db.Querier, tz *time.Location, contractIDs []uuid.UUID, withMoney bool) ([]Milestone, error) {
+	h := &Handlers{TZ: tz}
+	return h.loadMilestones(ctx, q, `m.contract_id = ANY($1)`, withMoney, contractIDs)
+}

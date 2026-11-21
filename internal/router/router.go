@@ -251,6 +251,7 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 
 	a.GET("/reports/contract-lines", need(access.ContractsRead), co.ReportContractLines)
 	a.GET("/reports/overview", need(access.ContractsRead), co.ReportOverview)
+	a.GET("/reports/calendar", need(access.ContractsRead), co.ReportCalendar)
 
 	r.NoRoute(func(c *gin.Context) { response.Fail(c, errNotFound) })
 	return r

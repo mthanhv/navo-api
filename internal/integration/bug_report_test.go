@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -127,4 +128,28 @@ func hasFlag(line map[string]any, code string) bool {
 		}
 	}
 	return false
+}
+
+// Recording a customer payment can allocate it in the same step; a refused allocation records nothing.
+func TestReceiptRecordedAndAllocatedTogether(t *testing.T) {
+	e := setup(t)
+	e.user("rv@test.vn", []string{"admin"})
+	actor := e.login("rv@test.vn")
+	f := e.activeContract(actor, "RVA", "10")
+	m := e.must(201, e.do(actor, "POST", "/api/v1/contracts/"+f.contract+"/milestones", map[string]any{"name": "All", "amount": "10", "trigger": "signing", "days_after": 0}, nil), "term")
+	receipt := func(amount, alloc, k string) result {
+		return e.do(actor, "POST", "/api/v1/receipts", map[string]any{"customer_id": f.customer, "received_on": "2026-10-01", "amount": amount, "currency": "VND", "method": "bank",
+			"allocations": []any{map[string]any{"milestone_id": m["id"], "amount": alloc}}}, key(k))
+	}
+	if r := receipt("20", "15", "rv-over"); r.Status != 400 || !hasFieldCode(r, "exceeds_open") {
+		t.Fatalf("allocating more than is owed: %d %v", r.Status, r.Body)
+	}
+	var n int
+	if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM receipts`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("a refused allocation left a receipt behind: %d %v", n, err)
+	}
+	r := e.must(201, receipt("8", "6", "rv-ok"), "record and allocate")
+	if r["allocated"] != "6" || r["unallocated"] != "2" {
+		t.Fatalf("allocated together: %v", r)
+	}
 }

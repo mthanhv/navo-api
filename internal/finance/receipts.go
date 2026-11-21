@@ -119,6 +119,8 @@ type receiptInput struct {
 	Method     string  `json:"method"`
 	Reference  *string `json:"reference"`
 	Note       *string `json:"note"`
+	// Allocations, optional: apply the money to open payment terms in the same step.
+	Allocations []allocationIn `json:"allocations"`
 }
 
 func trimmedPtr(s *string, max int, field string, errs *apperrors.FieldErrors) *string {
@@ -168,6 +170,7 @@ func (h *Handlers) CreateReceipt(c *gin.Context) {
 	}
 	ref := trimmedPtr(in.Reference, 200, "reference", &errs)
 	note := trimmedPtr(in.Note, 500, "note", &errs)
+	wants := parseAllocations(&errs, in.Allocations)
 	if err := errs.Err(); err != nil {
 		response.Fail(c, err)
 		return
@@ -190,6 +193,11 @@ func (h *Handlers) CreateReceipt(c *gin.Context) {
 		}
 		if err := audit.Record(ctx, tx, "create", "receipt", id, map[string]any{"number": number, "amount": amount.String(), "currency": cur}); err != nil {
 			return nil, err
+		}
+		if len(wants) > 0 { // record and allocate in one transaction: both happen or neither
+			if err := h.allocateTx(ctx, tx, id, wants, p.UserID); err != nil {
+				return nil, err
+			}
 		}
 		return h.loadReceipt(ctx, tx, id, true)
 	})
@@ -270,10 +278,7 @@ func (h *Handlers) ListReceipts(c *gin.Context) {
 }
 
 type allocateInput struct {
-	Allocations []struct {
-		MilestoneID string `json:"milestone_id"`
-		Amount      string `json:"amount"`
-	} `json:"allocations"`
+	Allocations []allocationIn `json:"allocations"`
 }
 
 // Allocate handles POST /receipts/:id/allocations (idempotent). Each amount goes to a
@@ -295,88 +300,106 @@ func (h *Handlers) Allocate(c *gin.Context) {
 	if len(in.Allocations) == 0 {
 		errs.Add("allocations", "required", map[string]any{"min": 1})
 	}
-	type want struct {
-		milestone uuid.UUID
-		amount    decimal.Decimal
-	}
-	wants := make([]want, len(in.Allocations))
-	seen := map[uuid.UUID]bool{}
-	for i, a := range in.Allocations {
-		f := func(n string) string { return "allocations[" + itoa(i) + "]." + n }
-		wants[i] = want{httpx.UUID(&errs, f("milestone_id"), a.MilestoneID), decimalx.Positive(&errs, f("amount"), a.Amount).Round(2)}
-		if seen[wants[i].milestone] {
-			errs.Add(f("milestone_id"), "duplicate", nil)
-		}
-		seen[wants[i].milestone] = true
-	}
+	wants := parseAllocations(&errs, in.Allocations)
 	if err := errs.Err(); err != nil {
 		response.Fail(c, err)
 		return
 	}
 	httpx.Command(c, h.Pool, "receipts.allocate", true, 200, func(tx pgx.Tx) (any, error) {
 		ctx := c.Request.Context()
-		// Lock the receipt first, then milestones in id order, so concurrent allocations serialize.
-		if err := tx.QueryRow(ctx, `SELECT id FROM receipts WHERE id = $1 FOR UPDATE`, id).Scan(new(uuid.UUID)); err != nil {
-			return nil, err
-		}
-		// A lock-waiting SELECT retains its original statement snapshot. Read sums
-		// in a new statement after acquiring the lock, not in that SELECT.
-		r, err := scanReceipt(tx.QueryRow(ctx, receiptSelect+` WHERE r.id = $1`, id))
-		if err != nil {
-			return nil, err
-		}
-		if r.Status != "posted" {
-			return nil, apperrors.Rule("receipt_cancelled", "This receipt was cancelled.", nil)
-		}
-		total := decimal.Zero
-		for _, w := range wants {
-			total = total.Add(w.amount)
-		}
-		if total.GreaterThan(r.Unallocated) {
-			return nil, apperrors.Rule("allocation_exceeds_receipt", "The amounts are more than what is left on this receipt.",
-				map[string]any{"left": r.Unallocated.String(), "requested": total.String()})
-		}
-		ids := make([]uuid.UUID, len(wants))
-		for i, w := range wants {
-			ids[i] = w.milestone
-		}
-		// Serialize cancellation/amendments with collection before locking terms.
-		if _, err := tx.Exec(ctx, `SELECT c.id FROM contracts c WHERE c.id IN (SELECT contract_id FROM payment_milestones WHERE id=ANY($1)) ORDER BY c.id FOR UPDATE`, ids); err != nil {
-			return nil, err
-		}
-		if _, err := tx.Exec(ctx, `SELECT 1 FROM payment_milestones WHERE id = ANY($1) ORDER BY id FOR UPDATE`, ids); err != nil {
-			return nil, err
-		}
-		ms, err := h.loadMilestones(ctx, tx, `m.id = ANY($1) AND c.status IN ('active', 'closed')`, true, ids)
-		if err != nil {
-			return nil, err
-		}
-		byID := map[uuid.UUID]Milestone{}
-		for _, m := range ms {
-			byID[m.ID] = m
-		}
-		for i, w := range wants {
-			m, ok := byID[w.milestone]
-			field := "allocations[" + itoa(i) + "]"
-			switch {
-			case !ok || m.CustomerID != r.CustomerID:
-				return nil, apperrors.Invalid(field+".milestone_id", "other_customer", nil)
-			case m.Currency != r.Currency:
-				return nil, apperrors.Invalid(field+".milestone_id", "other_currency", map[string]any{"currency": m.Currency})
-			case m.Status == "wait":
-				return nil, apperrors.Invalid(field+".milestone_id", "not_collectable", nil)
-			case w.amount.GreaterThan(*m.Open):
-				return nil, apperrors.Invalid(field+".amount", "exceeds_open", map[string]any{"open": m.Open.String()})
-			}
-			if _, err := tx.Exec(ctx, `INSERT INTO receipt_allocations (receipt_id, milestone_id, amount, created_by) VALUES ($1, $2, $3, $4)`, id, w.milestone, w.amount, p.UserID); err != nil {
-				return nil, err
-			}
-		}
-		if err := audit.Record(ctx, tx, "allocate", "receipt", id, map[string]any{"total": total.String(), "lines": len(wants)}); err != nil {
+		if err := h.allocateTx(ctx, tx, id, wants, p.UserID); err != nil {
 			return nil, err
 		}
 		return h.loadReceipt(ctx, tx, id, true)
 	})
+}
+
+type allocationIn = struct {
+	MilestoneID string `json:"milestone_id"`
+	Amount      string `json:"amount"`
+}
+
+type wantAllocation struct {
+	milestone uuid.UUID
+	amount    decimal.Decimal
+}
+
+func parseAllocations(errs *apperrors.FieldErrors, in []allocationIn) []wantAllocation {
+	wants := make([]wantAllocation, len(in))
+	seen := map[uuid.UUID]bool{}
+	for i, a := range in {
+		f := func(n string) string { return "allocations[" + itoa(i) + "]." + n }
+		wants[i] = wantAllocation{httpx.UUID(errs, f("milestone_id"), a.MilestoneID), decimalx.Positive(errs, f("amount"), a.Amount).Round(2)}
+		if seen[wants[i].milestone] {
+			errs.Add(f("milestone_id"), "duplicate", nil)
+		}
+		seen[wants[i].milestone] = true
+	}
+	return wants
+}
+
+// allocateTx applies money of a receipt to collectable milestones of the same customer and
+// currency, never above what is still open on each nor what is left on the receipt. Used by
+// Allocate and by CreateReceipt (record and allocate in one step).
+func (h *Handlers) allocateTx(ctx context.Context, tx pgx.Tx, id uuid.UUID, wants []wantAllocation, actor uuid.UUID) error {
+	// Lock the receipt first, then milestones in id order, so concurrent allocations serialize.
+	if err := tx.QueryRow(ctx, `SELECT id FROM receipts WHERE id = $1 FOR UPDATE`, id).Scan(new(uuid.UUID)); err != nil {
+		return err
+	}
+	// A lock-waiting SELECT retains its original statement snapshot. Read sums
+	// in a new statement after acquiring the lock, not in that SELECT.
+	r, err := scanReceipt(tx.QueryRow(ctx, receiptSelect+` WHERE r.id = $1`, id))
+	if err != nil {
+		return err
+	}
+	if r.Status != "posted" {
+		return apperrors.Rule("receipt_cancelled", "This receipt was cancelled.", nil)
+	}
+	total := decimal.Zero
+	for _, w := range wants {
+		total = total.Add(w.amount)
+	}
+	if total.GreaterThan(r.Unallocated) {
+		return apperrors.Rule("allocation_exceeds_receipt", "The amounts are more than what is left on this receipt.",
+			map[string]any{"left": r.Unallocated.String(), "requested": total.String()})
+	}
+	ids := make([]uuid.UUID, len(wants))
+	for i, w := range wants {
+		ids[i] = w.milestone
+	}
+	// Serialize cancellation/amendments with collection before locking terms.
+	if _, err := tx.Exec(ctx, `SELECT c.id FROM contracts c WHERE c.id IN (SELECT contract_id FROM payment_milestones WHERE id=ANY($1)) ORDER BY c.id FOR UPDATE`, ids); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM payment_milestones WHERE id = ANY($1) ORDER BY id FOR UPDATE`, ids); err != nil {
+		return err
+	}
+	ms, err := h.loadMilestones(ctx, tx, `m.id = ANY($1) AND c.status IN ('active', 'closed')`, true, ids)
+	if err != nil {
+		return err
+	}
+	byID := map[uuid.UUID]Milestone{}
+	for _, m := range ms {
+		byID[m.ID] = m
+	}
+	for i, w := range wants {
+		m, ok := byID[w.milestone]
+		field := "allocations[" + itoa(i) + "]"
+		switch {
+		case !ok || m.CustomerID != r.CustomerID:
+			return apperrors.Invalid(field+".milestone_id", "other_customer", nil)
+		case m.Currency != r.Currency:
+			return apperrors.Invalid(field+".milestone_id", "other_currency", map[string]any{"currency": m.Currency})
+		case m.Status == "wait":
+			return apperrors.Invalid(field+".milestone_id", "not_collectable", nil)
+		case w.amount.GreaterThan(*m.Open):
+			return apperrors.Invalid(field+".amount", "exceeds_open", map[string]any{"open": m.Open.String()})
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO receipt_allocations (receipt_id, milestone_id, amount, created_by) VALUES ($1, $2, $3, $4)`, id, w.milestone, w.amount, actor); err != nil {
+			return err
+		}
+	}
+	return audit.Record(ctx, tx, "allocate", "receipt", id, map[string]any{"total": total.String(), "lines": len(wants)})
 }
 
 type reverseInput struct {
