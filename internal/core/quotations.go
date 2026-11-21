@@ -146,7 +146,7 @@ func (h *Handlers) ListQuotations(c *gin.Context) {
 	rows, err := h.Pool.Query(c.Request.Context(), quotationSelect+`
 		WHERE ($1::uuid IS NULL OR q.owner_id=$1)
 		  AND ($2='' OR strpos(vn_fold(q.number), vn_fold($2)) > 0 OR strpos(vn_fold(q.title), vn_fold($2)) > 0 OR strpos(vn_fold(o.name), vn_fold($2)) > 0 OR strpos(vn_fold(o.code), vn_fold($2)) > 0)
-		ORDER BY (q.status IN ('draft','sent')) DESC, q.valid_until, q.created_at DESC, q.id`, p.OwnerFilter(), q)
+		ORDER BY q.created_at DESC, q.id`, p.OwnerFilter(), q)
 	if err != nil {
 		response.Fail(c, err)
 		return

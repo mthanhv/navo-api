@@ -246,7 +246,7 @@ func (h *Handlers) ListReceipts(c *gin.Context) {
 	}
 	// Page in SQL: receipts grow every day and nothing here is computed after loading.
 	n := len(args)
-	rows, err := h.Pool.Query(ctx, receiptSelect+filter+fmt.Sprintf(` ORDER BY r.received_on DESC, r.number DESC LIMIT $%d OFFSET $%d`, n+1, n+2),
+	rows, err := h.Pool.Query(ctx, receiptSelect+filter+fmt.Sprintf(` ORDER BY r.created_at DESC, r.number DESC LIMIT $%d OFFSET $%d`, n+1, n+2),
 		append(args, size, (page-1)*size)...)
 	if err != nil {
 		response.Fail(c, err)

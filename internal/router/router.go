@@ -64,7 +64,7 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 
 	authSvc := auth.NewService(pool, cfg.SessionTTL, cfg.CookieSecure)
 	authSvc.RequireAdminMFA = cfg.RequireAdminMFA
-	md := &masterdata.Handlers{Pool: pool}
+	md := &masterdata.Handlers{Pool: pool, TaxLookupURL: cfg.TaxLookupURL}
 	co := &core.Handlers{Pool: pool, TZ: cfg.Timezone}
 	us := &users.Handlers{Pool: pool}
 	docs := &documents.Handlers{Pool: pool, Store: files.Store{Dir: cfg.FilesDir}}
@@ -92,6 +92,7 @@ func NewWithMailer(cfg config.Config, pool *pgxpool.Pool, mail mailer.Sender) ht
 
 	a.GET("/organizations", need(access.ContractsRead), md.ListOrganizations)
 	a.GET("/organizations/suggest-code", need(access.PartnersWrite), md.SuggestCode)
+	a.GET("/organizations/tax-lookup", need(access.PartnersWrite), md.LookupTaxCode)
 	a.POST("/organizations", need(access.PartnersWrite), md.CreateOrganization)
 	a.PATCH("/organizations/:id", need(access.PartnersWrite), md.UpdateOrganization)
 	a.GET("/products", need(access.ContractsRead), md.ListProducts)

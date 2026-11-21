@@ -127,7 +127,7 @@ func (h *Handlers) ListLeads(c *gin.Context) {
 	rows, err := h.Pool.Query(c.Request.Context(), leadSelect+` WHERE `+leadScope+` AND ($2::uuid IS NULL OR o.owner_id = $2)
 		AND ($3 = '' OR strpos(vn_fold(o.name), vn_fold($3)) > 0 OR strpos(vn_fold(o.code), vn_fold($3)) > 0 OR strpos(vn_fold(o.industry), vn_fold($3)) > 0
 		     OR EXISTS (SELECT 1 FROM contacts ct WHERE ct.organization_id = o.id AND (strpos(vn_fold(ct.full_name), vn_fold($3)) > 0 OR strpos(vn_fold(ct.phone), vn_fold($3)) > 0)))
-		ORDER BY coalesce(na.planned_on, '9999-12-31'), coalesce(la.done_at, o.lead_since) DESC, o.name, o.id`, p.OwnerFilter(), owner, q)
+		ORDER BY o.created_at DESC, o.id`, p.OwnerFilter(), owner, q)
 	if err != nil {
 		response.Fail(c, err)
 		return

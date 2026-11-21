@@ -26,9 +26,9 @@ Start over: `dropdb navo_dev && createdb navo_dev && make migrate && make seed`.
 To clear transaction records while preserving users, partners, products, settings, document
 number sequences, and audit history, run `make clear-transaction-data` first to preview row
 counts. The script removes quotations, contracts and their lifecycle documents, purchase and
-delivery documents, receipts, invoices, payments, MISA exports, transaction-only attachments,
-and idempotency records. It also removes stored file bytes when a file is no longer linked to
-any non-transaction record.
+delivery documents, service visits, receipts, invoices, payments, MISA exports,
+transaction-only attachments, and idempotency records. It also removes stored file bytes when
+a file is no longer linked to any non-transaction record.
 
 Deletion is opt-in and limited to database names containing a `dev`, `test`, or `local` marker:
 
@@ -40,7 +40,8 @@ make clear-transaction-data ARGS="--url-env TEST_DATABASE_URL --execute --confir
 The script refuses production/live names and requires the exact database name as confirmation.
 Stop the API before execution. It does not clear CRM activities, mailings, notifications, or
 audit history. Run it from a database owner account so the cleanup can temporarily disable
-history-protection triggers inside the transaction.
+history-protection triggers inside the transaction. Database cleanup commits before stored file
+bytes are removed; any file-removal failure is reported with the exact path.
 
 ### Local email with Mailpit
 

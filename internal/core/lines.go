@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"sort"
 	"strings"
 	"time"
 
@@ -69,7 +68,7 @@ const lineProgressSQL = `
 WITH lines AS (
     SELECT cl.id, cl.contract_id, coalesce(c.number, c.draft_number) AS contract_number, c.customer_id, o.name AS customer_name,
            c.owner_id, u.full_name AS owner_name, cl.line_no, cl.name_on_contract, cl.unit, cl.quantity, cl.unit_price, cl.due_on,
-           cl.last_business_change_at, cl.line_type
+           cl.last_business_change_at, cl.line_type, c.created_at AS contract_created_at
     FROM contract_lines cl
     JOIN contracts c ON c.id = cl.contract_id
     JOIN organizations o ON o.id = c.customer_id
@@ -132,7 +131,8 @@ LEFT JOIN delivered d ON d.contract_line_id = l.id
 LEFT JOIN late_receipts lr ON lr.contract_line_id = l.id
 LEFT JOIN next_plan np ON np.contract_line_id = l.id
 LEFT JOIN planned pl ON pl.contract_line_id = l.id
-ORDER BY l.contract_number, l.line_no`
+ORDER BY l.contract_created_at DESC, l.contract_id, l.line_no -- newest contract first, its lines in order
+`
 
 // QueryLines returns line progress for the caller's scope. With contractID it
 // returns that contract's lines (any status); otherwise lines of active contracts.
@@ -233,9 +233,6 @@ func (h *Handlers) ReportContractLines(c *gin.Context) {
 			continue
 		}
 		filtered = append(filtered, r)
-	}
-	if tab == "action" {
-		sort.SliceStable(filtered, func(i, j int) bool { return severityRank(filtered[i]) < severityRank(filtered[j]) })
 	}
 	page, size := httpx.Page(c)
 	start := min((page-1)*size, len(filtered))

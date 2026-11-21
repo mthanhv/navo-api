@@ -814,7 +814,7 @@ func lifecycleDocs(ctx context.Context, q db.Querier, contractID uuid.UUID, docs
 		}
 		return pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
 	}
-	am, err := ids(`SELECT id FROM contract_amendments WHERE contract_id = $1 ORDER BY number`)
+	am, err := ids(`SELECT id FROM contract_amendments WHERE contract_id = $1 ORDER BY created_at DESC, number DESC`)
 	if err != nil {
 		return err
 	}
@@ -826,7 +826,7 @@ func lifecycleDocs(ctx context.Context, q db.Querier, contractID uuid.UUID, docs
 		docs.Amendments = append(docs.Amendments, a)
 	}
 	for kind, dst := range map[string]*[]*EventDoc{"acceptance": &docs.Acceptances, "customer_return": &docs.CustomerReturns, "supplier_return": &docs.SupplierReturns} {
-		list, err := ids(`SELECT id FROM ` + eventTables[kind].table + ` WHERE contract_id = $1 ORDER BY number`)
+		list, err := ids(`SELECT id FROM ` + eventTables[kind].table + ` WHERE contract_id = $1 ORDER BY created_at DESC, number DESC`)
 		if err != nil {
 			return err
 		}

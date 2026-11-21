@@ -77,7 +77,8 @@ type Milestone struct {
 	// Editable: no issued invoice is linked, so the term can still be corrected (even on an active contract).
 	Editable bool `json:"editable"`
 	// Deletable: nothing was invoiced or paid against it.
-	Deletable bool `json:"deletable"`
+	Deletable bool      `json:"deletable"`
+	CreatedAt time.Time `json:"-"` // lists show the newest first
 }
 
 // milestoneSQL loads milestones with what decides their trigger date: the contract's
@@ -93,7 +94,8 @@ SELECT m.id, m.contract_id, c.number, c.customer_id, cu.name, m.seq, m.version, 
         ) x ORDER BY x.on_date DESC, x.number DESC LIMIT 1) AS last_delivery,
        coalesce((SELECT sum(a.amount) FROM receipt_allocations a WHERE a.milestone_id = m.id AND a.reversed_at IS NULL), 0)::text,
        NOT EXISTS (SELECT 1 FROM sales_invoices si WHERE si.milestone_id = m.id AND si.status = 'issued') AND c.status IN ('draft', 'active'),
-       NOT EXISTS (SELECT 1 FROM sales_invoices si WHERE si.milestone_id = m.id) AND NOT EXISTS (SELECT 1 FROM receipt_allocations a WHERE a.milestone_id = m.id) AND c.status IN ('draft', 'active')
+       NOT EXISTS (SELECT 1 FROM sales_invoices si WHERE si.milestone_id = m.id) AND NOT EXISTS (SELECT 1 FROM receipt_allocations a WHERE a.milestone_id = m.id) AND c.status IN ('draft', 'active'),
+       m.created_at
 FROM payment_milestones m JOIN contracts c ON c.id = m.contract_id JOIN organizations cu ON cu.id = c.customer_id`
 
 func (h *Handlers) loadMilestones(ctx context.Context, q db.Querier, where string, withMoney bool, args ...any) ([]Milestone, error) {
@@ -113,7 +115,7 @@ func (h *Handlers) loadMilestones(ctx context.Context, q db.Querier, where strin
 		var fullyDelivered bool
 		var lastDelivery *string
 		if err := rows.Scan(&m.ID, &m.ContractID, &number, &m.CustomerID, &m.CustomerName, &m.Seq, &m.Version, &m.Name, &percent, &amount, &m.Currency, &m.Trigger,
-			&m.DaysAfter, &fixed, &triggered, &m.TriggerNote, &m.AcceptanceID, &signed, &fullyDelivered, &lastDelivery, &paid, &m.Editable, &m.Deletable); err != nil {
+			&m.DaysAfter, &fixed, &triggered, &m.TriggerNote, &m.AcceptanceID, &signed, &fullyDelivered, &lastDelivery, &paid, &m.Editable, &m.Deletable, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		if number != nil {
@@ -668,20 +670,8 @@ func (h *Handlers) Receivables(c *gin.Context) {
 		}
 		return summary[i].Currency < summary[j].Currency
 	})
-	rank := map[string]int{"late": 0, "soon": 1, "later": 2, "wait": 3, "paid": 4}
-	sort.SliceStable(items, func(i, j int) bool {
-		if rank[items[i].Status] != rank[items[j].Status] {
-			return rank[items[i].Status] < rank[items[j].Status]
-		}
-		a, b := "9999", "9999"
-		if items[i].DueOn != nil {
-			a = *items[i].DueOn
-		}
-		if items[j].DueOn != nil {
-			b = *items[j].DueOn
-		}
-		return a < b
-	})
+	// Newest first, as in every list (owner rule 2026-11-21); the tabs already split late, soon and later.
+	sort.SliceStable(items, func(i, j int) bool { return items[i].CreatedAt.After(items[j].CreatedAt) })
 	response.OK(c, gin.H{"items": items, "counts": counts, "summary": summary, "as_of": time.Now()})
 }
 

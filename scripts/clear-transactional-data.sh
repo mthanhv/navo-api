@@ -80,7 +80,7 @@ cd "$project_dir"
 
 database_name=$(psql "$database_url" -X -v ON_ERROR_STOP=1 -At -c 'SELECT current_database()')
 database_name_lower=$(printf '%s' "$database_name" | tr '[:upper:]' '[:lower:]')
-if [[ "$database_name_lower" =~ (^|[_-])(prod|production|live)([_-]|$) ]]; then
+if [[ "$database_name_lower" == *prod* || "$database_name_lower" == *live* ]]; then
   echo "Refusing to run against a production/live database: $database_name" >&2
   exit 2
 fi
@@ -306,11 +306,13 @@ while IFS= read -r file_id; do
     exit 1
   fi
   file_path="$files_dir/${file_id:0:2}/$file_id"
-  if ! rm -f -- "$file_path"; then
-    echo "Database cleanup committed, but could not remove stored file: $file_path" >&2
-    exit 1
+  if [[ -e "$file_path" || -L "$file_path" ]]; then
+    if ! rm -f -- "$file_path"; then
+      echo "Database cleanup committed, but could not remove stored file: $file_path" >&2
+      exit 1
+    fi
+    removed_files=$((removed_files + 1))
   fi
-  removed_files=$((removed_files + 1))
 done <"$removed_file_ids"
 
 printf 'Cleanup complete. Removed %d transaction-only file(s).\n' "$removed_files"

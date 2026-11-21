@@ -30,6 +30,9 @@ type Config struct {
 	// ZaloAPIBase is the Zalo Bot API host (tests point it at a fake); PublicURL puts links in messages.
 	ZaloAPIBase string
 	PublicURL   string
+	// TaxLookupURL fills a customer/supplier from its tax code (only the code is sent); set it
+	// empty to turn the lookup off.
+	TaxLookupURL string
 }
 
 // Load reads the environment.
@@ -42,6 +45,7 @@ func Load() (Config, error) {
 		AIModel:         envOr("NAVO_AI_MODEL", "claude-opus-5-5"),
 		ZaloAPIBase:     envOr("NAVO_ZALO_API_BASE", "https://bot-api.zaloplatforms.com"),
 		PublicURL:       os.Getenv("NAVO_PUBLIC_URL"),
+		TaxLookupURL:    taxLookupURL(),
 		SMTP: mailer.Config{Host: os.Getenv("NAVO_SMTP_HOST"), Port: envOr("NAVO_SMTP_PORT", "587"), Username: os.Getenv("NAVO_SMTP_USERNAME"),
 			Password: os.Getenv("NAVO_SMTP_PASSWORD"), From: os.Getenv("NAVO_MAIL_FROM")},
 	}
@@ -87,4 +91,13 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// taxLookupURL is NAVO_TAXCODE_LOOKUP_URL; unset means VietQR's free business lookup, and an
+// explicitly empty value turns the feature off.
+func taxLookupURL() string {
+	if v, ok := os.LookupEnv("NAVO_TAXCODE_LOOKUP_URL"); ok {
+		return strings.TrimSpace(v)
+	}
+	return "https://api.vietqr.io/v2/business"
 }

@@ -276,7 +276,7 @@ func (h *Handlers) ContractDocuments(c *gin.Context) {
 	}
 	docs := Documents{PurchaseOrders: []*PurchaseOrder{}, GoodsReceipts: []*GoodsReceipt{}, DeliveryOrders: []*DeliveryOrder{},
 		Amendments: []*Amendment{}, Acceptances: []*EventDoc{}, CustomerReturns: []*EventDoc{}, SupplierReturns: []*EventDoc{}}
-	poIDs, err := ids(`SELECT id FROM purchase_orders WHERE contract_id = $1 ORDER BY number`)
+	poIDs, err := ids(`SELECT id FROM purchase_orders WHERE contract_id = $1 ORDER BY created_at DESC, number DESC`)
 	if err == nil {
 		for _, x := range poIDs {
 			po, e := loadPO(ctx, h.Pool, x, p)
@@ -289,7 +289,7 @@ func (h *Handlers) ContractDocuments(c *gin.Context) {
 	}
 	if err == nil {
 		var grIDs []uuid.UUID
-		if grIDs, err = ids(`SELECT id FROM goods_receipts WHERE contract_id = $1 ORDER BY number`); err == nil {
+		if grIDs, err = ids(`SELECT id FROM goods_receipts WHERE contract_id = $1 ORDER BY created_at DESC, number DESC`); err == nil {
 			for _, x := range grIDs {
 				gr, e := loadGR(ctx, h.Pool, x, p)
 				if e != nil {
@@ -302,7 +302,7 @@ func (h *Handlers) ContractDocuments(c *gin.Context) {
 	}
 	if err == nil {
 		var doIDs []uuid.UUID
-		if doIDs, err = ids(`SELECT id FROM delivery_orders WHERE contract_id = $1 ORDER BY number`); err == nil {
+		if doIDs, err = ids(`SELECT id FROM delivery_orders WHERE contract_id = $1 ORDER BY created_at DESC, number DESC`); err == nil {
 			for _, x := range doIDs {
 				d, e := loadDO(ctx, h.Pool, x, p)
 				if e != nil {

@@ -53,7 +53,10 @@ WITH po_lines AS (
     WHERE ($1::uuid IS NULL OR c.owner_id = $1)
       AND ($2 = 'all' OR ($2 = 'draft' AND po.status = 'draft') OR ($2 = 'awaiting' AND po.status = 'confirmed' AND a.done < a.lines))
 )
-SELECT *, count(*) OVER () FROM list ORDER BY late DESC, next_eta NULLS LAST, number LIMIT $4 OFFSET $5`
+SELECT *, count(*) OVER () FROM list
+-- grouped by contract (the contract with the newest order first), each contract's orders newest first
+ORDER BY (SELECT max(x.created_at) FROM purchase_orders x WHERE x.contract_id = list.contract_id) DESC, list.contract_id,
+         (SELECT x.created_at FROM purchase_orders x WHERE x.id = list.id) DESC, number DESC LIMIT $4 OFFSET $5`
 	rows, err := h.Pool.Query(ctx, base, p.OwnerFilter(), view, h.today(), size, (page-1)*size)
 	if err != nil {
 		response.Fail(c, err)
@@ -102,10 +105,8 @@ func (h *Handlers) ListDeliveryOrders(c *gin.Context) {
 	p := auth.Principal(c)
 	page, size := httpx.Page(c)
 	delivered := c.DefaultQuery("view", "planned") == "delivered"
-	order := `d.planned_on NULLS FIRST, d.created_at DESC, d.number DESC`
-	if delivered {
-		order = `d.delivered_on DESC, d.number DESC`
-	}
+	// Grouped by contract (the contract with the newest delivery first), each contract's deliveries newest first.
+	order := `(SELECT max(x.created_at) FROM delivery_orders x WHERE x.contract_id = d.contract_id) DESC, d.contract_id, d.created_at DESC, d.number DESC`
 	rows, err := h.Pool.Query(ctx, `SELECT d.id, d.number, d.status, c.id, c.number, o.name, d.planned_on, d.firmness, d.delivered_on,
 			(SELECT count(*) FROM delivery_order_lines WHERE delivery_order_id = d.id),
 			(d.status = 'draft' AND d.firmness = 'firm' AND d.planned_on < $3),

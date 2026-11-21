@@ -294,7 +294,7 @@ func (h *Handlers) ListInvoices(c *gin.Context) {
 		args = append(args, id)
 		where = append(where, "i.contract_id = $"+itoa(len(args)))
 	}
-	rows, err := h.Pool.Query(ctx, sql+` WHERE `+strings.Join(where, " AND ")+` ORDER BY i.issued_on DESC, i.number DESC`, args...)
+	rows, err := h.Pool.Query(ctx, sql+` WHERE `+strings.Join(where, " AND ")+` ORDER BY i.created_at DESC, i.number DESC`, args...)
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -490,7 +490,7 @@ func (h *Handlers) ListPayments(c *gin.Context) {
 		sql += ` AND p.paid_on >= $1 AND p.paid_on < $2`
 		args = append(args, start, start.AddDate(0, 1, 0))
 	}
-	rows, err := h.Pool.Query(ctx, sql+` ORDER BY p.paid_on DESC, p.number DESC`, args...)
+	rows, err := h.Pool.Query(ctx, sql+` ORDER BY p.created_at DESC, p.number DESC`, args...)
 	if err != nil {
 		response.Fail(c, err)
 		return

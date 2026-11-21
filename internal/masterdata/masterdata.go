@@ -29,7 +29,11 @@ import (
 )
 
 // Handlers serve the master-data endpoints.
-type Handlers struct{ Pool *pgxpool.Pool }
+type Handlers struct {
+	Pool *pgxpool.Pool
+	// TaxLookupURL is the business register a tax code is looked up in; empty turns lookups off.
+	TaxLookupURL string
+}
 
 var (
 	orgCode = regexp.MustCompile(`^[A-Z0-9]{2,12}$`)
@@ -257,7 +261,7 @@ func (h *Handlers) ListOrganizations(c *gin.Context) {
 		WHERE ($1 = '' OR ($1 = 'customer' AND o.is_customer) OR ($1 = 'supplier' AND o.is_supplier) OR ($1 = 'prospect' AND (o.is_customer OR (o.lead_stage IS NOT NULL AND o.lead_stage <> 'lost'))))
 		  AND ($2 = '' OR strpos(vn_fold(o.code), vn_fold($2)) > 0 OR strpos(vn_fold(o.name), vn_fold($2)) > 0
 		       OR EXISTS (SELECT 1 FROM contacts ct WHERE ct.organization_id = o.id AND (strpos(vn_fold(ct.full_name), vn_fold($2)) > 0 OR strpos(vn_fold(ct.email), vn_fold($2)) > 0 OR strpos(vn_fold(ct.phone), vn_fold($2)) > 0)))
-		ORDER BY vn_fold(o.name), o.name, o.id LIMIT $3 OFFSET $4`, role, q, size, (page-1)*size, auth.Principal(c).OwnerFilter())
+		ORDER BY o.created_at DESC, o.id LIMIT $3 OFFSET $4`, role, q, size, (page-1)*size, auth.Principal(c).OwnerFilter())
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -420,7 +424,7 @@ func (h *Handlers) ListProducts(c *gin.Context) {
 	rows, err := h.Pool.Query(c.Request.Context(), `SELECT p.id, p.code, p.name, p.manufacturer, p.manufacturer_code, p.unit, p.description, p.origin, p.supplier_id, s.name, p.supplier_item_code, count(*) OVER ()
 		FROM products p LEFT JOIN organizations s ON s.id = p.supplier_id
 		WHERE $1 = '' OR strpos(vn_fold(p.code), vn_fold($1)) > 0 OR strpos(vn_fold(p.name), vn_fold($1)) > 0 OR strpos(vn_fold(p.manufacturer_code), vn_fold($1)) > 0 OR strpos(vn_fold(p.manufacturer), vn_fold($1)) > 0 OR strpos(vn_fold(p.supplier_item_code), vn_fold($1)) > 0
-		ORDER BY vn_fold(p.name), p.name, p.id LIMIT $2 OFFSET $3`, q, size, (page-1)*size)
+		ORDER BY p.created_at DESC, p.id LIMIT $2 OFFSET $3`, q, size, (page-1)*size)
 	if err != nil {
 		response.Fail(c, err)
 		return

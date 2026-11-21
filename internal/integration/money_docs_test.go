@@ -157,7 +157,16 @@ func TestReceivablesAndAllocation(t *testing.T) {
 	}
 	rec := e.must(200, e.do(mai, "GET", "/api/v1/receivables?tab=all", nil, nil), "receivables")
 	items := rec["items"].([]any)
-	if items[0].(map[string]any)["status"] != "late" || items[0].(map[string]any)["due_on"] != "2026-09-15" || items[1].(map[string]any)["status"] != "wait" {
+	byID := map[string]map[string]any{}
+	for _, it := range items {
+		m := it.(map[string]any)
+		byID[m["id"].(string)] = m
+	}
+	// Lists show the newest first (owner rule 2026-11-21): the acceptance term was added last.
+	if items[0].(map[string]any)["id"] != acc["id"] {
+		t.Fatalf("receivables are not newest first: %v", items)
+	}
+	if a, w := byID[adv["id"].(string)], byID[acc["id"].(string)]; a["status"] != "late" || a["due_on"] != "2026-09-15" || w["status"] != "wait" {
 		t.Fatalf("advance is due 14 days after signing and late; acceptance not yet: %v", items)
 	}
 

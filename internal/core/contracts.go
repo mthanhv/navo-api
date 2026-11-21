@@ -483,7 +483,7 @@ func (h *Handlers) ListContracts(c *gin.Context) {
 		WHERE ($1::uuid IS NULL OR c.owner_id = $1) AND c.status = ANY($2) AND ($4::uuid IS NULL OR c.customer_id = $4) AND ($5 = '' OR c.kind = $5)
 		  AND ($3 = '' OR strpos(vn_fold(c.number), vn_fold($3)) > 0 OR strpos(vn_fold(c.draft_number), vn_fold($3)) > 0 OR strpos(vn_fold(c.title), vn_fold($3)) > 0
 		       OR strpos(vn_fold(o.name), vn_fold($3)) > 0 OR strpos(vn_fold(o.code), vn_fold($3)) > 0 OR strpos(vn_fold(c.customer_reference), vn_fold($3)) > 0)
-		ORDER BY (c.status = 'active') DESC, c.number DESC NULLS LAST, c.created_at DESC, c.id`, owner, statuses, q, customer, kind)
+		ORDER BY c.created_at DESC, c.id`, owner, statuses, q, customer, kind)
 	if err != nil {
 		response.Fail(c, err)
 		return

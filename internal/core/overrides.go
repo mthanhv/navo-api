@@ -192,7 +192,7 @@ func (h *Handlers) ListOverrides(c *gin.Context) {
 		response.Fail(c, err)
 		return
 	}
-	order := map[bool]string{false: `requested_at`, true: `decided_at DESC`}[decided]
+	order := `requested_at DESC` // newest first in every list (owner rule 2026-11-21)
 	rows, err := h.Pool.Query(ctx, `SELECT id FROM quantity_override_requests WHERE (status = 'pending') = $1 AND status <> 'withdrawn' ORDER BY `+order+`, id LIMIT $2 OFFSET $3`,
 		!decided, size, (page-1)*size)
 	if err != nil {
